@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Lightroom files (if accidentally placed in repo)
+*.lrcat
+*.lrcat-data/
+*.lrdata/
+*.lrcat-wal
+*.lrcat-shm
+*.lrcat-lock
