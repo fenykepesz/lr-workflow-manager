@@ -23,6 +23,9 @@ Usage:
   python lr_workflow.py --arrive     Arriving home (SSD → Desktop)
   python lr_workflow.py --leave      Leaving home (Desktop → SSD)
   python lr_workflow.py --sync       Sync files only
+
+DISCLAIMER: This script is provided "as-is" without warranty. 
+The author takes no responsibility for any damage caused by its usage.
 """
 
 import os

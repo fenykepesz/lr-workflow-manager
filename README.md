@@ -1,5 +1,8 @@
 # Lightroom Workflow Manager
 
+> [!WARNING]
+> **DISCLAIMER**: This script is provided **"as-is"** without any warranty of any kind, either express or implied. The author takes **no responsibility** for any damage, data loss, or issues caused by the usage of this script. Use it at your own risk. Always ensure you have backups of your Lightroom catalogs and photos before running any automation.
+
 A Python script for photographers who edit in **Adobe Lightroom Classic** across multiple machines — typically a desktop workstation at home and a laptop on the road — using a portable SSD as the bridge between them.
 
 ## The Problem
