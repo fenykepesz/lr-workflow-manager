@@ -32,23 +32,66 @@ import os
 import sys
 import shutil
 import glob
+import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
 # ============================================================
-# CONFIGURATION - Edit these paths to match your setup
+# LOGGING SETUP
 # ============================================================
+LOG_FILE = "workflow_log.txt"
 
-# SSD paths (H:\ on Windows when SSD is connected)
-SSD_PHOTOS = r"H:\Photography"                        # photo folder on SSD
-SSD_CATALOG_DIR = r"H:\Catalog"                        # catalog folder on SSD
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# CONFIGURATION LOADER
+# ============================================================
+CONFIG_FILE = "config.json"
+
+def load_config():
+    """Load configuration from config.json or fall back to defaults."""
+    # Default paths for developer reference
+    defaults = {
+        "ssd_photos": r"H:\Photography",
+        "ssd_catalog_dir": r"H:\Catalog",
+        "desktop_photos": r"E:\Photography",
+        "desktop_catalog_dir": r"C:\Lightroom\Catalog",
+        "catalog_name": "MyCatalog"
+    }
+
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+                return {**defaults, **config}
+        except Exception as e:
+            print(f"  WARNING: Error loading {CONFIG_FILE}: {e}")
+            print("  Using default/previous configuration.")
+    
+    return defaults
+
+# Load the config
+config = load_config()
+
+# SSD paths
+SSD_PHOTOS = config["ssd_photos"]
+SSD_CATALOG_DIR = config["ssd_catalog_dir"]
 
 # Desktop paths
-DESKTOP_PHOTOS = r"E:\Photography"                     # main photo archive on desktop
-DESKTOP_CATALOG_DIR = r"C:\Lightroom\Catalog"          # local catalog working folder
+DESKTOP_PHOTOS = config["desktop_photos"]
+DESKTOP_CATALOG_DIR = config["desktop_catalog_dir"]
 
-# Catalog filename (without extension or path)
-CATALOG_NAME = "MyCatalog"
+# Catalog filename
+CATALOG_NAME = config["catalog_name"]
 
 # ============================================================
 # END OF CONFIGURATION
@@ -351,21 +394,14 @@ def scan_files(source, destination):
 
 def sync_photos(auto_mode=False):
     """Sync photo files from SSD to desktop. Returns True if sync was run."""
-    print("\n" + "=" * 65)
-    print("  SYNC FILES: SSD → Desktop")
-    print("=" * 65)
-    print(f"  Source:      {SSD_PHOTOS}")
-    print(f"  Destination: {DESKTOP_PHOTOS}")
-    print(f"  Mode:        {'Auto (no prompts)' if auto_mode else 'Interactive'}")
-    print("=" * 65)
+    logger.info(f"Starting SYNC: {SSD_PHOTOS} -> {DESKTOP_PHOTOS}")
 
     if not os.path.exists(SSD_PHOTOS):
-        print(f"\n  ERROR: SSD not found at {SSD_PHOTOS}")
-        print("  Make sure the SSD is connected.")
+        logger.error(f"SSD not found at {SSD_PHOTOS}")
         return False
 
     if not os.path.exists(DESKTOP_PHOTOS):
-        print(f"\n  Creating destination: {DESKTOP_PHOTOS}")
+        logger.info(f"Creating destination: {DESKTOP_PHOTOS}")
         os.makedirs(DESKTOP_PHOTOS, exist_ok=True)
 
     print("\n  Scanning files...")
@@ -376,7 +412,7 @@ def sync_photos(auto_mode=False):
     total_new_size = sum(f["size"] for f in new_files)
     total_mod_size = sum(f["src_size"] for f in modified_files)
 
-    print(f"\n  Scan complete:")
+    logger.info(f"Scan complete: {len(new_files)} new, {len(modified_files)} modified, {len(unchanged_files)} unchanged")
     print(f"    New files:       {len(new_files):>6}  ({format_size(total_new_size)})")
     print(f"    Modified files:  {len(modified_files):>6}  ({format_size(total_mod_size)})")
     print(f"    Unchanged:       {len(unchanged_files):>6}")
@@ -415,7 +451,7 @@ def sync_photos(auto_mode=False):
                 print(f"\n    ERROR copying {f['rel']}: {e}")
 
         if new_files:
-            print(f"  New files: {copied} copied, {errors} errors")
+            logger.info(f"New files: {copied} copied, {errors} errors")
 
     # ---- Handle modified files ----
     if modified_files:
@@ -616,7 +652,7 @@ def copy_catalog(src_dir, dst_dir, src_label, dst_label):
             print(f"  Backing up .lrcat ({format_size(dst_info['lrcat_size'])})...")
             try:
                 copy_file_with_progress(dst_info["lrcat_path"], backup_lrcat, label="Backup .lrcat: ")
-                print("  Backup .lrcat done.")
+                logger.info(f"Backup .lrcat done: {backup_lrcat}")
             except Exception as e:
                 print(f"\n  WARNING: Could not backup .lrcat: {e}")
                 resp = input("  Continue without backup? (y/N): ").strip().lower()
@@ -629,7 +665,7 @@ def copy_catalog(src_dir, dst_dir, src_label, dst_label):
                 print(f"  Backing up .lrcat-data ({format_size(dst_info['data_size'])})...")
                 try:
                     copy_directory(dst_info["data_path"], backup_data, label="Backup .lrcat-data: ")
-                    print("  Backup .lrcat-data done.")
+                    logger.info(f"Backup .lrcat-data done: {backup_data}")
                 except Exception as e:
                     print(f"\n  WARNING: Could not backup .lrcat-data: {e}")
 
@@ -669,7 +705,7 @@ def copy_catalog(src_dir, dst_dir, src_label, dst_label):
     elif os.path.exists(dst_data):
         print(f"  Note: No .lrcat-data in {src_label}; leaving {dst_label} copy as-is.")
 
-    print(f"\n  Catalog successfully copied: {src_label} → {dst_label}")
+    logger.info(f"Catalog successfully copied: {src_label} → {dst_label}")
     return True
 
 
@@ -679,9 +715,7 @@ def copy_catalog(src_dir, dst_dir, src_label, dst_label):
 
 def arriving_home():
     """Full workflow for returning home with SSD."""
-    print("\n" + "#" * 65)
-    print("  ARRIVING HOME - SSD → Desktop")
-    print("#" * 65)
+    logger.info("WORKFLOW: ARRIVING HOME started.")
 
     # Step 0: Verify SSD is connected
     if not os.path.exists(SSD_PHOTOS):
@@ -735,9 +769,7 @@ def arriving_home():
 
 def leaving_home():
     """Full workflow for preparing SSD to leave with."""
-    print("\n" + "#" * 65)
-    print("  LEAVING HOME - Desktop → SSD")
-    print("#" * 65)
+    logger.info("WORKFLOW: LEAVING HOME started.")
 
     # Step 0: Verify SSD is connected
     if not os.path.exists(SSD_PHOTOS):

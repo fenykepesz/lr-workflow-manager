@@ -66,20 +66,24 @@ Keeping the catalog in its own folder (separate from photos) avoids clutter from
 
 ### 2. Configure the Script
 
-Edit the configuration section at the top of `lr_workflow.py`:
-
-```python
-# SSD paths (drive letter assigned when SSD is connected)
-SSD_PHOTOS = r"H:\Photography"
-SSD_CATALOG_DIR = r"H:\Catalog"
-
-# Desktop paths
-DESKTOP_PHOTOS = r"E:\Photography"
-DESKTOP_CATALOG_DIR = r"C:\Lightroom\Catalog"
-
-# Your catalog filename (without extension)
-CATALOG_NAME = "MyCatalog"
+Copy the example configuration file:
+```bash
+cp config.json.example config.json
 ```
+
+Edit `config.json` with your paths:
+
+```json
+{
+    "ssd_photos": "H:\\Photography",
+    "ssd_catalog_dir": "H:\\Catalog",
+    "desktop_photos": "E:\\Photography",
+    "desktop_catalog_dir": "C:\\Lightroom\\Catalog",
+    "catalog_name": "MyCatalog"
+}
+```
+
+*Note: Use double backslashes (`\\`) for Windows paths in JSON.*
 
 ### 3. Place the Files
 

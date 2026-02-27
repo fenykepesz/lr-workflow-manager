@@ -19,3 +19,7 @@ desktop.ini
 *.lrcat-wal
 *.lrcat-shm
 *.lrcat-lock
+
+# Project Config and Logs
+config.json
+workflow_log.txt
