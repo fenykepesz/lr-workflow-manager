@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy this file to config.json and edit. config.json is not committed to git.",
+
+  "catalog_name": "MyCatalog",
+  "desktop_catalog_dir": "C:\\Lightroom\\Catalog",
+  "desktop_photos": "E:\\Photography",
+  "backup_dir": "C:\\Lightroom\\LRWM-Backups",
+
+  "ssd_label": "TravelSSD",
+  "ssd_fallback_drive": "H:",
+  "ssd_photos_subdir": "Photography",
+  "ssd_catalog_subdir": "Catalog",
+  "mac_volume_name": "",
+
+  "keep_backups": 5,
+  "keep_ssd_backups": 2
+}

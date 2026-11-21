@@ -1,185 +1,132 @@
 # Lightroom Workflow Manager
 
 > [!WARNING]
-> **DISCLAIMER**: This script is provided **"as-is"** without any warranty of any kind, either express or implied. The author takes **no responsibility** for any damage, data loss, or issues caused by the usage of this script. Use it at your own risk. Always ensure you have backups of your Lightroom catalogs and photos before running any automation.
+> **DISCLAIMER**: This script is provided **"as-is"** without any warranty of any kind, either express or implied. The author takes **no responsibility** for any damage, data loss, or issues caused by its use. Use it at your own risk and keep independent backups of your catalogs and photos.
 
-A Python script for photographers who edit in **Adobe Lightroom Classic** across multiple machines — typically a desktop workstation at home and a laptop on the road — using a portable SSD as the bridge between them.
+Edit with **Adobe Lightroom Classic** on a travel laptop while your desktop PC stays the main workstation. The tool runs on the Windows PC. It needs only Python, with nothing extra to install.
 
-## The Problem
+## The idea: check the catalog out, check it back in
 
-Lightroom Classic stores everything in a single catalog file (`.lrcat`), and Adobe offers no built-in way to sync that catalog across machines. Photographers who work on both a desktop and a laptop face a painful workflow gap:
+A Lightroom Classic catalog can't be shared between computers or synced through cloud folders. This tool treats your catalog like a library book:
 
-- **Cloud sync doesn't work.** Dropbox, OneDrive, and similar services can corrupt Lightroom's SQLite-based catalog through simultaneous access and sync conflicts. Adobe explicitly warns against this.
-- **Lightroom's built-in "Export as Catalog" is tedious.** It's designed for handing off subsets of a catalog, not for round-tripping an entire working library between machines.
-- **Manual copying is error-prone.** Forgetting which machine has the latest edits, overwriting newer work with an older catalog, or leaving new photos unsynced from a trip can all lead to data loss.
+- **Leave**: the catalog is copied to a portable SSD and the PC copy is **locked**, so you can't edit it by accident while you're away.
+- **On the road**: open the catalog from the SSD on the laptop and work as usual, with Photoshop, plugins and everything else.
+- **Arrive**: new and edited photos are copied into your archive, the catalog comes back to the PC, and the SSD copy is retired.
 
-The typical real-world scenario: you shoot on location with your laptop, import and edit on the road, come home, and want to continue editing on your desktop with its larger screen and faster storage — without losing any work from either machine.
+The catalog is only ever editable in one place, so there's nothing to merge and nothing can conflict. Inside Lightroom you don't use any export, import or sync feature. You just open the catalog.
 
-## The Solution
+### No manual "Update Folder Location"
 
-This script automates the two critical transitions in a portable-SSD workflow:
+Lightroom stores the absolute path of each **top-level** folder only, such as `E:/Photography/`. Everything below it is stored relative to that folder. When copying the catalog, the tool changes that path:
 
-### Arriving Home (SSD → Desktop)
-1. **Syncs photo files** from the SSD to the desktop archive (new and modified files only, never deletes)
-2. **Copies the catalog** (`.lrcat` + `.lrcat-data`) from the SSD to a local working folder on the desktop
+| Direction | Top-level folder becomes |
+|---|---|
+| Leave (PC to SSD) | `E:/Photography/` becomes `/Volumes/<SSD name>/Photography/` |
+| Arrive (SSD to PC) | `/Volumes/<SSD name>/Photography/` becomes `E:/Photography/` |
 
-### Leaving Home (Desktop → SSD)
-1. **Checks for unsynced files** to catch forgotten imports
-2. **Copies the catalog** from the desktop back to the SSD, ready for the laptop
+On the laptop, photos that are on the SSD show as online and the rest of the archive shows as offline, but you can still search and browse it. New imports go under the same folder structure as the archive.
 
-### Safety Features
+If a trip was imported on the laptop as a separate top-level folder, the tool folds it into the main folder as an ordinary subfolder. It skips this if a folder with the same path already exists there, and reports it.
 
-The script includes multiple failsafes to prevent the most common data-loss scenarios:
+> [!NOTE]
+> This edits Lightroom's catalog database, which Adobe doesn't document. The tool only changes the copy, never your live catalog. It changes only the top-level folder table, inside a single transaction, after an integrity check, and checks integrity again afterwards. A full backup is always taken first.
 
-- **Lightroom lock detection** — blocks all operations if Lightroom is still running (checks for `.lrcat-wal`/`.shm`/`.lock` files)
-- **Timestamp conflict detection** — warns if the destination catalog is *newer* than the source (meaning you'd overwrite recent edits), requiring you to type `OVERWRITE` to confirm
-- **Redundant copy detection** — flags when both catalogs have identical timestamps, avoiding unnecessary overwrites
-- **Forgotten sync warning** — when leaving home, scans the SSD for files not yet backed up to the desktop
-- **Timestamped backups** — optionally backs up the destination catalog before every overwrite, with filenames like `MyCatalog_20260227_143022.lrcat`
-- **exFAT timestamp tolerance** — handles the 2-second rounding inherent to exFAT-formatted drives, eliminating false "modified" detections during file comparison
-- **Progress bars** — visual feedback for both multi-file syncs and large single-file catalog copies
+### Taking archive photos along
+
+When leaving, you can choose archive folders to take along, for example `Models\Ira; Abroad\25-10 Budapest`. They're copied to the same relative place on the SSD, so their originals are online on the laptop: full-size editing, Photoshop, exports. When you're back, anything edited or added in them is copied back to the archive.
+
+## Safety features
+
+- **Lightroom must be closed**: the tool checks both the running program and the catalog's lock and journal files (`.lrcat.lock`, `-wal`, `-shm`, `-journal`) on the PC and on the SSD.
+- **One editable copy**: while the catalog is out, the PC copy is renamed to `.lrcat.checked-out`. Once it's back, the SSD copy is renamed to `.lrcat.returned`.
+- **Copies are all-or-nothing**: every copy is written to a temporary file and only replaces the original once complete. Catalogs are also checked against a checksum. An interrupted copy never leaves a half-written catalog.
+- **State changes last**: photos and catalog are copied before anything is locked or unlocked. If something fails, the catalog stays usable where it was, and you can re-run.
+- **Backups, cleaned up automatically**: a full backup of the PC catalog is made before every checkout (keeping the last 5 by default). A catalog already on the SSD is moved to `LRWM-Backups` on the SSD, never deleted.
+- **Never overwrites newer files**: if a file differs and the destination copy is newer or the same age, it's left alone and reported.
+- **Catches forgotten photos**: Leave warns if the SSD has photos that never made it into the archive.
+- **Wrong SSD, or a catalog upgraded on the laptop**: Arrive refuses if the SSD doesn't hold this checkout, or if Lightroom on the laptop upgraded the catalog to a newer version.
+- **Dry run**: `--dry-run`, or `D` in the menu, shows the full plan without changing anything.
+- **Emergency release**: if the SSD is lost, unlock the PC catalog as it was at checkout.
+- **Skips system junk**: macOS `._*` and `.DS_Store` files, Windows `Thumbs.db`, and Lightroom preview caches.
 
 ## Requirements
 
-- **Python 3.6+** (uses f-strings and `pathlib`)
-- **Windows** (paths use drive letters; macOS adaptation possible — see notes below)
-- No external dependencies — standard library only
+- Python 3.8+ on the Windows PC, with nothing else to install.
+- An SSD formatted as **exFAT**, so both Windows and macOS can read and write it.
+- **The same Lightroom Classic version on both computers.** A newer version upgrades the catalog, and then the older one can't open it.
+- Install your plugins and presets on both machines. They live in each machine's Lightroom settings, not in the catalog.
 
 ## Setup
 
-### 1. Prepare Your SSD
+1. Lay out the SSD like this:
+   ```
+   SSD (named e.g. "TravelSSD")
+   ├── Catalog\        ← the tool puts the catalog here
+   └── Photography\    ← photos; mirrors the structure of your archive
+   ```
+2. Copy `config.example.json` to `config.json` and fill it in:
 
-Format your portable SSD as **exFAT** for cross-platform compatibility (readable by both Windows and macOS). Organize it with separate folders for photos and the catalog:
+   | Setting | Meaning |
+   |---|---|
+   | `catalog_name` | Catalog file name without `.lrcat` |
+   | `desktop_catalog_dir` | Folder holding the catalog on the PC |
+   | `desktop_photos` | The archive's top-level folder, as it appears in Lightroom's Folders panel |
+   | `backup_dir` | Where catalog backups and the log go |
+   | `ssd_label` | The SSD's volume name. It's found by name whatever drive letter Windows assigns. |
+   | `ssd_fallback_drive` | Drive letter to try if no drive has that name |
+   | `mac_volume_name` | The SSD's name on the Mac, if different from `ssd_label` |
+   | `keep_backups` / `keep_ssd_backups` | How many backups to keep |
 
-```
-SSD (H:\)
-├── Catalog/
-│   ├── MyCatalog.lrcat
-│   └── MyCatalog.lrcat-data/
-└── Photography/
-    ├── 2024/
-    ├── 2025/
-    └── ...
-```
-
-Keeping the catalog in its own folder (separate from photos) avoids clutter from Lightroom's auto-generated preview and helper files.
-
-### 2. Configure the Script
-
-Edit the configuration section at the top of `lr_workflow.py`:
-
-```python
-# SSD paths (drive letter assigned when SSD is connected)
-SSD_PHOTOS = r"H:\Photography"
-SSD_CATALOG_DIR = r"H:\Catalog"
-
-# Desktop paths
-DESKTOP_PHOTOS = r"E:\Photography"
-DESKTOP_CATALOG_DIR = r"C:\Lightroom\Catalog"
-
-# Your catalog filename (without extension)
-CATALOG_NAME = "MyCatalog"
-```
-
-### 3. Place the Files
-
-Put both `lr_workflow.py` and `lr_workflow.bat` in a convenient location (e.g., `E:\Scripts\`). Double-click the `.bat` file to launch, or run from a terminal.
-
-### 4. First Run
-
-1. Close Lightroom on all machines
-2. Connect the SSD
-3. Run the script → choose **[1] Arriving Home**
-4. Open Lightroom → **File > Open Catalog** → navigate to the desktop catalog path
-5. In the **Folders panel**, right-click the top-level folder → **Update Folder Location** → point to your desktop photo archive (e.g., `E:\Photography`)
-
-The folder location remap is a one-time step per machine. Lightroom remembers it for subsequent opens.
+   `config.json` is listed in `.gitignore`, so your paths stay private.
+3. Run `lr_workflow.bat` (double-click), or `python lr_workflow.py`.
 
 ## Usage
 
-### Interactive Menu
-
 ```
-  =====================================================================
-  LIGHTROOM WORKFLOW MANAGER
-  =====================================================================
-  SSD Photos:       H:\Photography
-  Desktop Photos:   E:\Photography
-  SSD Catalog:      H:\Catalog
-  Desktop Catalog:  C:\Lightroom\Catalog
-  Catalog Name:     MyCatalog
-
-  SSD Status:       CONNECTED
-  SSD Catalog:      2026-02-27 09:15:32  (1.54 GB)
-  Desktop Catalog:  2026-02-25 18:42:10  (1.54 GB)
-
-  Options:
-    [1] Arriving Home  - Sync files + copy catalog SSD → Desktop
-    [2] Leaving Home   - Copy catalog Desktop → SSD
-    [3] Sync Files     - Copy photos SSD → Desktop only
-    [4] Compare        - Show catalog comparison only
-    [Q] Quit
+  [1] Leave        check the catalog out to the SSD (+ take archive folders along)
+  [2] Arrive       bring the catalog and new photos back to the PC
+  [3] Take along   copy more archive folders to the SSD
+  [4] Copy photos  copy new photos from the SSD to the archive only
+  [5] Status       details, backups, what's on the SSD
+  [D] Dry run      show plans without changing anything
+  [R] Emergency release   (only while checked out)
 ```
 
-### Command-Line Shortcuts
+Command line:
 
 ```bash
-python lr_workflow.py --arrive       # Arriving home workflow
-python lr_workflow.py --leave        # Leaving home workflow
-python lr_workflow.py --sync         # Sync files only
-python lr_workflow.py --sync --auto  # Sync files, auto-confirm all
+python lr_workflow.py --status
+python lr_workflow.py --leave --folders "Models\Ira;Abroad\25-10 Budapest"
+python lr_workflow.py --arrive
+python lr_workflow.py --leave --dry-run
+python lr_workflow.py --take "Models\Ivory Flame"     # while the catalog is out, too
+python lr_workflow.py --copy-photos                    # (--sync still works)
 ```
 
-## How It Works
+### On the laptop
 
-### Photo Sync Logic
+1. Connect the SSD. In Lightroom Classic, choose **File > Open Catalog** and pick `/Volumes/<SSD>/Catalog/<name>.lrcat`.
+2. Import new photos into `/Volumes/<SSD>/Photography/<trip folder>`.
+3. Edit, including Photoshop round-trips. The PSDs and TIFFs land next to the originals on the SSD.
+4. Quit Lightroom before ejecting the SSD.
 
-The script scans the SSD photo folder and compares each file against the desktop archive:
+## What is copied
 
-- **New files** (exist on SSD but not on desktop) → copied to desktop
-- **Modified files** (exist on both but differ in size or timestamp) → prompted to replace, with size and date comparison shown
-- **Unchanged files** → skipped
-- **Desktop-only files** → left untouched (the script never deletes)
+| Item | Copied? |
+|---|---|
+| `.lrcat` (the catalog) | Yes, checked against a checksum |
+| `.lrcat-data` (masks and AI edit data) | Yes |
+| `Previews.lrdata`, `Helper.lrdata`, `Smart Previews.lrdata` | No. These belong to each machine and Lightroom rebuilds them. |
+| Photos | Leave: only the folders you choose. Arrive: everything on the SSD that's new or newer than the archive. |
 
-A 2-second timestamp tolerance accounts for exFAT's reduced time resolution compared to NTFS.
+Nothing is ever deleted from the archive.
 
-### Catalog Copy Logic
+## Tests
 
-Only the essential catalog components are copied:
-
-| File | Purpose | Copied? |
-|------|---------|---------|
-| `.lrcat` | Main catalog database (SQLite) | ✅ Yes |
-| `.lrcat-data/` | Mask and AI edit data (LR Classic 11+) | ✅ Yes |
-| `Previews.lrdata/` | Rendered previews (can be 50+ GB) | ❌ Machine-specific, auto-regenerated |
-| `Helper.lrdata/` | Face detection and search index | ❌ Machine-specific, auto-regenerated |
-| `Smart Previews.lrdata/` | Compressed DNGs for offline editing | ❌ Machine-specific, regenerate as needed |
-
-### What About the Mac Side?
-
-This script handles the Windows desktop side of the workflow. On macOS:
-
-1. Connect the SSD
-2. Open Lightroom → **File > Open Catalog** → select the `.lrcat` on the SSD
-3. **Update Folder Location** to `/Volumes/[SSD_Name]/Photography` (first time only)
-4. Edit normally — all changes are saved directly to the SSD catalog
-5. Close Lightroom before disconnecting the SSD
-
-When you return home, the script's **Arriving Home** workflow picks up where the Mac left off.
-
-## Backup Management
-
-Backups accumulate in a `Backups/` subfolder at each catalog location. Each backup is timestamped and includes both the `.lrcat` file and `.lrcat-data` folder. At ~1.5 GB per catalog backup, these can grow quickly — periodically delete older backups you no longer need.
-
-```
-C:\Lightroom\Catalog\Backups\
-├── MyCatalog_20260220_091500.lrcat
-├── MyCatalog_20260220_091500.lrcat-data/
-├── MyCatalog_20260225_184200.lrcat
-├── MyCatalog_20260225_184200.lrcat-data/
-└── ...
+```bash
+python -m unittest discover -s tests
 ```
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).

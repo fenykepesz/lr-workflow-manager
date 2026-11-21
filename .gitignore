@@ -19,3 +19,12 @@ desktop.ini
 *.lrcat-wal
 *.lrcat-shm
 *.lrcat-lock
+
+# Personal settings
+config.json
+
+# Temporary files from interrupted copies
+*.lrwm-tmp
+*.lrwm-old
+*.lrcat.lock
+*.lrcat-journal
