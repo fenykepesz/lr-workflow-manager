@@ -12,6 +12,7 @@
   "ssd_catalog_subdir": "Catalog",
   "mac_volume_name": "",
 
+  "take_along_collection": "Take along",
   "keep_backups": 5,
   "keep_ssd_backups": 2
 }

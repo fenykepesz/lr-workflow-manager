@@ -91,6 +91,56 @@ def root_folders(path: str) -> List[Tuple[int, str]]:
                          "order by absolutePath").fetchall()
 
 
+@dataclass
+class CollectionFolders:
+    found: bool = False                  # a regular collection with that name exists
+    smart_only: bool = False             # only a smart collection has that name
+    folders: List[Tuple[str, int]] = field(default_factory=list)  # (folder path under root, photo count)
+    outside: List[Tuple[str, int]] = field(default_factory=list)  # (folder path, count) not under the archive
+
+
+def collection_folders(lrcat: str, collection: str, archive_root: str) -> CollectionFolders:
+    """Folders (relative to archive_root, e.g. 'Models/Ira') of the photos in a
+    regular collection. Folders inside another listed folder are dropped,
+    since copying a folder includes its subfolders."""
+    result = CollectionFolders()
+    with closing(_ro(lrcat)) as c:
+        kinds = [k for (k,) in c.execute(
+            "select creationId from AgLibraryCollection where lower(name)=lower(?)", (collection,))]
+        result.found = "com.adobe.ag.library.collection" in kinds
+        result.smart_only = bool(kinds) and not result.found
+        if not result.found:
+            return result
+        rows = c.execute("""
+            select r.absolutePath, fo.pathFromRoot, count(distinct i.id_local)
+            from AgLibraryCollection col
+            join AgLibraryCollectionImage ci on ci.collection = col.id_local
+            join Adobe_images i on i.id_local = ci.image
+            join AgLibraryFile f on f.id_local = i.rootFile
+            join AgLibraryFolder fo on fo.id_local = f.folder
+            join AgLibraryRootFolder r on r.id_local = fo.rootFolder
+            where lower(col.name) = lower(?) and col.creationId = 'com.adobe.ag.library.collection'
+            group by r.absolutePath, fo.pathFromRoot""", (collection,)).fetchall()
+    inside = {}
+    for root, sub, n in rows:
+        full = root + sub
+        if _starts(full, archive_root):
+            rel = full[len(archive_root):].strip("/")
+            inside[rel] = inside.get(rel, 0) + n
+        else:
+            result.outside.append((full, n))
+    for rel in sorted(inside, key=str.casefold):
+        parents = [p for p in inside if p and p != rel and
+                   (rel.casefold() + "/").startswith(p.casefold() + "/")]
+        if rel and not parents:
+            total = inside[rel] + sum(n for q, n in inside.items()
+                                      if q != rel and q.casefold().startswith(rel.casefold() + "/"))
+            result.folders.append((rel, total))
+        elif not rel:
+            result.outside.append((archive_root + " (photos directly in the archive's top folder)", inside[rel]))
+    return result
+
+
 # ---------------------------------------------------------------- re-pointing
 
 def _starts(path: str, prefix: str) -> bool:

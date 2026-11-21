@@ -34,6 +34,14 @@ def make_catalog(path, roots):
             CREATE TABLE Adobe_variablesTable (id_local INTEGER PRIMARY KEY, id_global UNIQUE NOT NULL,
                 name, type, value NOT NULL DEFAULT '');
             INSERT INTO Adobe_variablesTable VALUES (1, 'v', 'Adobe_DBVersion', NULL, '1504001');
+            CREATE TABLE AgLibraryFile (id_local INTEGER PRIMARY KEY, id_global UNIQUE NOT NULL,
+                baseName NOT NULL DEFAULT '', extension NOT NULL DEFAULT '', folder INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE Adobe_images (id_local INTEGER PRIMARY KEY, id_global UNIQUE NOT NULL, rootFile INTEGER);
+            CREATE TABLE AgLibraryCollection (id_local INTEGER PRIMARY KEY, creationId NOT NULL DEFAULT '',
+                genealogy NOT NULL DEFAULT '', imageCount, name NOT NULL DEFAULT '', parent INTEGER,
+                systemOnly NOT NULL DEFAULT '');
+            CREATE TABLE AgLibraryCollectionImage (id_local INTEGER PRIMARY KEY, collection INTEGER NOT NULL DEFAULT 0,
+                image INTEGER NOT NULL DEFAULT 0, pick NOT NULL DEFAULT 0, positionInCollection);
         """)
         for absolute, folders in roots.items():
             rid = c.execute("insert into AgLibraryRootFolder (id_global, absolutePath, name) values (?,?,?)",
@@ -41,6 +49,31 @@ def make_catalog(path, roots):
             for f in folders:
                 c.execute("insert into AgLibraryFolder (id_global, pathFromRoot, rootFolder) values (?,?,?)",
                           (uuid.uuid4().hex, f, rid))
+        c.commit()
+
+
+def add_photo(path, root, folder, name, collection=None, smart=False):
+    """Add a photo at root+folder to the catalog, optionally into a collection."""
+    with closing(sqlite3.connect(path)) as c:
+        rid = c.execute("select id_local from AgLibraryRootFolder where absolutePath=?", (root,)).fetchone()[0]
+        row = c.execute("select id_local from AgLibraryFolder where rootFolder=? and pathFromRoot=?",
+                        (rid, folder)).fetchone()
+        fid = row[0] if row else c.execute(
+            "insert into AgLibraryFolder (id_global, pathFromRoot, rootFolder) values (?,?,?)",
+            (uuid.uuid4().hex, folder, rid)).lastrowid
+        base, ext = name.rsplit(".", 1)
+        file_id = c.execute("insert into AgLibraryFile (id_global, baseName, extension, folder) values (?,?,?,?)",
+                            (uuid.uuid4().hex, base, ext, fid)).lastrowid
+        img = c.execute("insert into Adobe_images (id_global, rootFile) values (?,?)",
+                        (uuid.uuid4().hex, file_id)).lastrowid
+        if collection:
+            kind = "com.adobe.ag.library.smart_collection" if smart else "com.adobe.ag.library.collection"
+            row = c.execute("select id_local from AgLibraryCollection where name=? and creationId=?",
+                            (collection, kind)).fetchone()
+            cid = row[0] if row else c.execute(
+                "insert into AgLibraryCollection (creationId, name) values (?,?)", (kind, collection)).lastrowid
+            if not smart:
+                c.execute("insert into AgLibraryCollectionImage (collection, image) values (?,?)", (cid, img))
         c.commit()
 
 
@@ -123,6 +156,27 @@ class RetargetTests(unittest.TestCase):
         self.assertEqual(lr.lock_files(self.tmp.name, "c"), [])
         self.assertIn(MAC_ROOT, dict((p, 1) for _, p in lr.root_folders(self.cat)))
 
+    def test_collection_folders(self):
+        make_catalog(self.cat, {WIN_ROOT: [""], "C:/Studio/": [""]})
+        add_photo(self.cat, WIN_ROOT, "Models/Ira/", "a.cr2", "Take along")
+        add_photo(self.cat, WIN_ROOT, "Models/Ira/", "b.cr2", "Take along")
+        add_photo(self.cat, WIN_ROOT, "Models/Ira/Selects/", "c.tif", "Take along")  # inside Ira
+        add_photo(self.cat, WIN_ROOT, "Abroad/25-10 Budapest/", "d.raf", "take along")  # name case
+        add_photo(self.cat, WIN_ROOT, "Abroad/Other/", "e.raf", "Something else")
+        add_photo(self.cat, "C:/Studio/", "", "f.cr2", "Take along")
+        res = lr.collection_folders(self.cat, "Take along", WIN_ROOT)
+        self.assertTrue(res.found)
+        self.assertEqual(res.folders, [("Abroad/25-10 Budapest", 1), ("Models/Ira", 3)])
+        self.assertEqual(res.outside, [("C:/Studio/", 1)])
+
+    def test_collection_missing_or_smart(self):
+        make_catalog(self.cat, {WIN_ROOT: [""]})
+        self.assertFalse(lr.collection_folders(self.cat, "Take along", WIN_ROOT).found)
+        add_photo(self.cat, WIN_ROOT, "X/", "a.cr2", "Take along", smart=True)
+        res = lr.collection_folders(self.cat, "Take along", WIN_ROOT)
+        self.assertTrue(res.smart_only)
+        self.assertEqual(res.folders, [])
+
     def test_db_version(self):
         make_catalog(self.cat, {WIN_ROOT: [""]})
         self.assertEqual(lr.db_version(self.cat), "1504001")
@@ -167,6 +221,40 @@ class FsopsTests(unittest.TestCase):
         with open(os.path.join(self.dst, "f"), "rb") as f:
             self.assertEqual(f.read(), b"old")
         self.assertFalse(os.path.exists(os.path.join(self.dst, "f") + fsops.TMP_SUFFIX))
+
+    def test_cleanup_groups_and_safety(self):
+        t = time.time() - 1000
+        ssd, arc = self.src, self.dst
+        j = os.path.join
+        for rel, data, in_archive in [
+            (j("Models", "Ira", "a.raf"), b"a", True),             # part of the trip: untouched
+            (j("Models", "Ivory", "b.raf"), b"b", True),           # safe
+            (j("Models", "loose.txt"), b"l", True),                # loose file next to a kept folder
+            (j("Abroad", "X", "c.raf"), b"c", True),               # safe
+            (j("Abroad", "Y", "d.raf"), b"d", False),              # only on SSD: must be kept
+        ]:
+            write(j(ssd, rel), data, t)
+            if in_archive:
+                write(j(arc, rel), data, t)
+        write(j(ssd, "Abroad", "X", "old.tif"), b"old", t)          # archive has a newer, bigger one
+        write(j(arc, "Abroad", "X", "old.tif"), b"newer!", t + 500)
+        write(j(ssd, "Abroad", "X", "._c.raf"), b"apple", t)
+        write(j(ssd, "Abroad", "X", ".DS_Store"), b"apple", t)
+
+        groups = fsops.plan_cleanup(ssd, arc, [j("Models", "Ira")])
+        by = {g.folder: g for g in groups}
+        self.assertEqual(sorted(by), ["Abroad", "Models", j("Models", "Ivory")])
+        self.assertTrue(by["Models"].files_only)
+        self.assertEqual([f.rel for f in by["Abroad"].unsafe], [j("Abroad", "Y", "d.raf")])
+        self.assertEqual(len(by["Abroad"].safe), 2)
+
+        self.assertEqual(fsops.remove_cleanup(ssd, groups), [])
+        self.assertFalse(os.path.exists(j(ssd, "Abroad", "X")))       # emptied, junk removed
+        self.assertTrue(os.path.exists(j(ssd, "Abroad", "Y", "d.raf")))
+        self.assertTrue(os.path.exists(j(ssd, "Models", "Ira", "a.raf")))
+        self.assertFalse(os.path.exists(j(ssd, "Models", "Ivory")))
+        self.assertFalse(os.path.exists(j(ssd, "Models", "loose.txt")))
+        self.assertTrue(os.path.exists(j(arc, "Abroad", "X", "c.raf")))  # archive untouched
 
     def test_copy_dir_atomic_replaces(self):
         write(os.path.join(self.src, "d", "1"), b"a")
@@ -245,10 +333,47 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(os.path.exists(state.returned_path(os.path.dirname(self.ssd_lrcat), "Cat")))
         self.assertEqual(state.read(self.pc_cat_dir)["status"], "home")
 
-        # Second trip: stale returned copy is moved aside, not deleted
-        self.answers = ["y"]
+        # Second trip, taking nothing: remove last trip's folders (all safe in archive),
+        # and the returned copy is moved aside, not deleted
+        self.answers = ["y", "y"]  # remove old folders, confirm plan
         workflows.leave(self.cfg, folders=[])
         self.assertTrue(os.path.isdir(os.path.join(self.ssd_root, "Catalog", "LRWM-Backups")))
+        self.assertEqual(os.listdir(os.path.join(self.ssd_root, "Photography")), [])
+        self.assertTrue(os.path.exists(os.path.join(self.archive, "Abroad", "26-12 Lisbon", "a.raf")))
+
+    def test_leave_takes_whole_folders_from_collection(self):
+        write(os.path.join(self.archive, "Models", "Ira", "Developed", "1.jpg"), b"jpg")
+        write(os.path.join(self.archive, "Models", "Ira", "1-Edit.tif"), b"tif")
+        write(os.path.join(self.archive, "Models", "Other", "2.raf"), b"other")
+        add_photo(self.cfg.desktop_lrcat, self.win_root, "Models/Ira/", "1.raf", "Take along")
+        self.answers = ["", "y"]  # Enter = take the collection's folders, then confirm
+        workflows.leave(self.cfg)
+        ssd_ira = os.path.join(self.ssd_root, "Photography", "Models", "Ira")
+        self.assertEqual(sorted(os.listdir(ssd_ira)), ["1-Edit.tif", "1.raf", "Developed"])
+        self.assertTrue(os.path.exists(os.path.join(ssd_ira, "Developed", "1.jpg")))
+        self.assertFalse(os.path.exists(os.path.join(self.ssd_root, "Photography", "Models", "Other")))
+        self.assertEqual(state.read(self.pc_cat_dir)["brought"], [os.path.join("Models", "Ira")])
+
+    def test_collection_choice_none_takes_nothing(self):
+        add_photo(self.cfg.desktop_lrcat, self.win_root, "Models/Ira/", "1.raf", "Take along")
+        self.answers = ["n", "y"]
+        workflows.leave(self.cfg)
+        self.assertFalse(os.path.exists(os.path.join(self.ssd_root, "Photography", "Models")))
+
+    def test_leave_declining_cleanup_keeps_ssd_folders(self):
+        old = os.path.join(self.ssd_root, "Photography", "Models", "Ira", "1.raf")
+        write(old, b"raw1", os.path.getmtime(os.path.join(self.archive, "Models", "Ira", "1.raf")))
+        self.answers = ["n", "y"]  # keep old folders, confirm plan
+        workflows.leave(self.cfg, folders=[])
+        self.assertTrue(os.path.exists(old))
+
+    def test_stale_ssd_catalog_is_set_aside_unopenable(self):
+        write(self.ssd_lrcat, b"stale catalog")
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        backups = os.path.join(self.ssd_root, "Catalog", "LRWM-Backups")
+        (only,) = os.listdir(backups)
+        self.assertEqual(os.listdir(os.path.join(backups, only)), ["Cat.lrcat.backup"])
 
     def test_arrive_without_edits_just_unlocks(self):
         self.answers = ["y"]

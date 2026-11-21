@@ -25,6 +25,7 @@ class Config:
     ssd_photos_subdir: str = "Photography"
     ssd_catalog_subdir: str = "Catalog"
     mac_volume_name: str = ""           # defaults to ssd_label
+    take_along_collection: str = "Take along"  # Lightroom collection marking folders to take
     keep_backups: int = 5
     keep_ssd_backups: int = 2
     extra_skip_names: List[str] = field(default_factory=list)

@@ -33,7 +33,34 @@ If a trip was imported on the laptop as a separate top-level folder, the tool fo
 
 ### Taking archive photos along
 
-When leaving, you can choose archive folders to take along, for example `Models\Ira; Abroad\25-10 Budapest`. They're copied to the same relative place on the SSD, so their originals are online on the laptop: full-size editing, Photoshop, exports. When you're back, anything edited or added in them is copied back to the archive.
+When leaving, you can take archive folders along. Each one is copied **whole**, with every file and subfolder (raws, TIFFs, PSDs, exports, sidecars), to the same relative place on the SSD. Their originals are then online on the laptop: full-size editing, Photoshop, exports. When you're back, anything edited or added in them is copied back to the archive.
+
+**Choosing folders from Lightroom:** create a regular collection called **Take along** (the name is configurable). Add any photo from a folder you want, and that whole folder is taken. One photo per folder is enough. Collections only list photos, so adding to one never moves files or changes folders. To be safe, add photos with right-click > *Add to Collection*, or set it as the target collection and press `B`. Don't drag photos onto a folder in the Folders panel, which moves them on disk.
+
+At Leave, the tool lists the folders it found, with their sizes:
+
+```
+  Folders of the photos in the Lightroom collection 'Take along':
+    Models\Ira                                       12.40 GB   (3 photo(s) in collection)
+    Abroad\25-10 Budapest                            48.12 GB   (1 photo(s) in collection)
+
+  [Enter] take these folders   [+] take these and add more   [M] choose manually instead   [N] take nothing
+```
+
+You can also type folder paths yourself (`?` lists the folders), or pass them with `--folders "Models\Ira;Abroad\25-10 Budapest"`. To stop taking a folder, remove its photos from the collection. That only takes them off the list; the photos themselves aren't touched.
+
+### Keeping the SSD in step with the trip
+
+Photos stay on the SSD between trips; Arrive never removes anything. At each **Leave**, any folders on the SSD that aren't part of this trip are listed, and you're asked whether to remove them (default **No**):
+
+```
+  On the SSD but not part of this trip:
+      Abroad\24-11 San Francisco                      312 file(s)   12.10 GB safe in archive
+      Models\Ivory Flame                              617 file(s)   15.44 GB safe in archive
+  Remove the files that are safe in the archive from the SSD? (y/N)
+```
+
+A file is only removed if the archive holds the same file, or a newer version of it. Anything else stays on the SSD and is listed. This keeps old versions off the laptop, and stops photos you deleted at home from being copied back by the next Arrive.
 
 ## Safety features
 
@@ -41,7 +68,7 @@ When leaving, you can choose archive folders to take along, for example `Models\
 - **One editable copy**: while the catalog is out, the PC copy is renamed to `.lrcat.checked-out`. Once it's back, the SSD copy is renamed to `.lrcat.returned`.
 - **Copies are all-or-nothing**: every copy is written to a temporary file and only replaces the original once complete. Catalogs are also checked against a checksum. An interrupted copy never leaves a half-written catalog.
 - **State changes last**: photos and catalog are copied before anything is locked or unlocked. If something fails, the catalog stays usable where it was, and you can re-run.
-- **Backups, cleaned up automatically**: a full backup of the PC catalog is made before every checkout (keeping the last 5 by default). A catalog already on the SSD is moved to `LRWM-Backups` on the SSD, never deleted.
+- **Backups, cleaned up automatically**: a full backup of the PC catalog is made before every checkout (keeping the last 5 by default). A catalog already on the SSD is moved to `LRWM-Backups` on the SSD, never deleted, and renamed `.lrcat.backup` so the laptop can't open it by mistake.
 - **Never overwrites newer files**: if a file differs and the destination copy is newer or the same age, it's left alone and reported.
 - **Catches forgotten photos**: Leave warns if the SSD has photos that never made it into the archive.
 - **Wrong SSD, or a catalog upgraded on the laptop**: Arrive refuses if the SSD doesn't hold this checkout, or if Lightroom on the laptop upgraded the catalog to a newer version.
@@ -75,6 +102,7 @@ When leaving, you can choose archive folders to take along, for example `Models\
    | `ssd_label` | The SSD's volume name. It's found by name whatever drive letter Windows assigns. |
    | `ssd_fallback_drive` | Drive letter to try if no drive has that name |
    | `mac_volume_name` | The SSD's name on the Mac, if different from `ssd_label` |
+   | `take_along_collection` | Lightroom collection marking folders to take along (default `Take along`) |
    | `keep_backups` / `keep_ssd_backups` | How many backups to keep |
 
    `config.json` is listed in `.gitignore`, so your paths stay private.

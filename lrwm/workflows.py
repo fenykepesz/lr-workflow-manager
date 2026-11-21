@@ -145,7 +145,10 @@ def stash_ssd_catalog(cfg: Config, ssd: drives.SSD) -> Optional[str]:
         return None
     dest = _new_dated_dir(ssd.backup_dir, name)
     for p in present:
-        os.rename(p, os.path.join(dest, os.path.basename(p)))
+        target = os.path.basename(p)
+        if p == ssd.lrcat:
+            target += ".backup"  # so Lightroom on the Mac can't open a set-aside copy by mistake
+        os.rename(p, os.path.join(dest, target))
     _rotate(ssd.backup_dir, name, cfg.keep_ssd_backups)
     log.info("Moved previous SSD catalog to %s", dest)
     return dest
@@ -189,8 +192,64 @@ def _normalize_rel(rel: str) -> str:
     return os.path.normpath(rel.strip().strip("\"'").strip("\\/")) if rel.strip() else ""
 
 
-def ask_folders(cfg: Config) -> List[str]:
-    """Interactive picker for archive folders to take along."""
+def folders_from_collection(cfg: Config, lrcat: str, root_lr: str) -> List[str]:
+    """Whole folders of the photos in the 'Take along' collection, as archive-relative paths."""
+    name = cfg.take_along_collection
+    if not name or not os.path.exists(lrcat):
+        return []
+    try:
+        res = lr.collection_folders(lrcat, name, root_lr)
+    except Exception as e:
+        ui.warn(f"Could not read the '{name}' collection: {e}")
+        return []
+    ui.info("")
+    if res.smart_only:
+        ui.info(f"'{name}' is a smart collection; please use a regular collection.")
+        return []
+    if not res.found:
+        ui.info(f"Tip: add photos to a Lightroom collection named '{name}' and their whole "
+                f"folders are offered here automatically.")
+        return []
+    if not (res.folders or res.outside):
+        ui.info(f"The '{name}' collection is empty.")
+        return []
+    ui.info(f"Folders of the photos in the Lightroom collection '{name}':")
+    chosen = []
+    for rel, count in res.folders:
+        rel_os = os.path.normpath(rel)
+        path = os.path.join(cfg.desktop_photos, rel_os)
+        if not os.path.isdir(path):
+            ui.info(f"    {rel_os}  (not found on disk, skipped)")
+            continue
+        ui.info(f"    {rel_os:<45} {ui.format_size(fsops.tree_size(path)):>10}   "
+                f"({count} photo(s) in collection)")
+        chosen.append(rel_os)
+    for full, count in res.outside:
+        ui.info(f"    skipped, not inside {cfg.desktop_photos}: {full} ({count} photo(s))")
+    return chosen
+
+
+def ask_folders(cfg: Config, suggested: Optional[List[str]] = None) -> List[str]:
+    """Pick archive folders to take along: from the collection, typed, or both."""
+    if suggested:
+        ui.info("")
+        ui.info("[Enter] take these folders   [+] take these and add more   "
+                "[M] choose manually instead   [N] take nothing")
+        while True:
+            choice = ui.ask("Choice: ").lower()
+            if choice in ("", "y", "yes"):
+                return suggested
+            if choice in ("n", "none"):
+                return []
+            if choice == "+":
+                return sorted(set(suggested) | set(_type_folders(cfg)), key=str.casefold)
+            if choice == "m":
+                return _type_folders(cfg)
+    return _type_folders(cfg)
+
+
+def _type_folders(cfg: Config) -> List[str]:
+    """Type folder paths, with ? to browse."""
     ui.info("")
     ui.info("Archive folders to take along (so you can edit their originals on the Mac).")
     ui.info(f"Paths are relative to {cfg.desktop_photos}, separated by ';'")
@@ -216,6 +275,33 @@ def ask_folders(cfg: Config) -> List[str]:
             ui.info("Not found in the archive: " + "; ".join(missing))
             continue
         return folders
+
+
+def _ask_cleanup(cfg: Config, cleanup: List[fsops.CleanupGroup], dry_run: bool) -> bool:
+    """Show SSD folders that aren't part of this trip; ask whether to remove the safe files."""
+    if not cleanup:
+        return False
+    ui.info("")
+    ui.info("On the SSD but not part of this trip:")
+    for g in cleanup:
+        label = f"{g.folder} (loose files only)" if g.files_only else g.folder
+        note = f", {len(g.unsafe)} kept (not safely in the archive)" if g.unsafe else ""
+        ui.info(f"    {label:<45} {len(g.safe):>5} file(s) {ui.format_size(g.safe_bytes):>10}"
+                f" safe in archive{note}")
+    unsafe = [f for g in cleanup for f in g.unsafe]
+    if unsafe:
+        ui.info("  Kept on the SSD because the archive doesn't have the same or a newer copy:")
+        for f in unsafe[:5]:
+            ui.info(f"    {f.rel}")
+        if len(unsafe) > 5:
+            ui.info(f"    ... and {len(unsafe) - 5} more")
+    if not any(g.safe for g in cleanup):
+        return False
+    if dry_run:
+        ui.info("  (A real run asks whether to remove the files that are safe in the archive.)")
+        return False
+    ui.info("  Removing them keeps old versions off the Mac. The archive copies are not touched.")
+    return ui.confirm("Remove the files that are safe in the archive from the SSD?", default=False)
 
 
 def _plan_bring(cfg: Config, ssd: drives.SSD, folders: List[str]):
@@ -284,31 +370,46 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
 
     # 3. Archive folders to take along
     if folders is None:
-        folders = [] if dry_run else ask_folders(cfg)
+        suggested = folders_from_collection(cfg, cfg.desktop_lrcat, cfg.desktop_root_lr)
+        folders = suggested if dry_run else ask_folders(cfg, suggested)
     bring = _plan_bring(cfg, ssd, folders)
 
-    # 4. Plan the catalog copy
+    # 4. Folders on the SSD that are not part of this trip
+    cleanup = fsops.plan_cleanup(ssd.photos, cfg.desktop_photos, folders, cfg.extra_skip_names)
+    remove_old = _ask_cleanup(cfg, cleanup, dry_run)
+    freed = sum(g.safe_bytes for g in cleanup) if remove_old else 0
+
+    # 5. Plan the catalog copy
     plan = _plan_readonly(cfg.desktop_lrcat, cfg.desktop_root_lr, cfg.mac_root_lr)
     data_dir = cfg.desktop_lrcat + "-data"
     catalog_bytes = os.path.getsize(cfg.desktop_lrcat) + (fsops.tree_size(data_dir) if os.path.isdir(data_dir) else 0)
     bring_bytes = sum(c.bytes_to_copy for _, c in bring)
-    _check_space(ssd.root, catalog_bytes + bring_bytes, "SSD")
+    _check_space(ssd.root, max(catalog_bytes + bring_bytes - freed, 0), "SSD")
     _check_space(cfg.backup_dir if os.path.isdir(cfg.backup_dir) else cfg.desktop_catalog_dir,
                  catalog_bytes, "backup drive")
 
     ui.header("Plan", "-")
-    ui.info(f"1. Back up the PC catalog to {cfg.backup_dir} (keeping the last {cfg.keep_backups})")
-    ui.info(f"2. Copy the catalog to {ssd.lrcat}  ({ui.format_size(catalog_bytes)})")
-    for line in lr.describe_plan(plan) or ["(no folder paths to change)"]:
-        ui.info(f"     {line}")
+    steps = []
+    if remove_old:
+        n = sum(len(g.safe) for g in cleanup)
+        steps.append([f"Remove from the SSD: {n} file(s) ({ui.format_size(freed)}) "
+                      f"already safe in the archive"])
+    steps.append([f"Back up the PC catalog to {cfg.backup_dir} (keeping the last {cfg.keep_backups})"])
+    steps.append([f"Copy the catalog to {ssd.lrcat}  ({ui.format_size(catalog_bytes)})"] +
+                 [f"   {line}" for line in lr.describe_plan(plan) or ["(no folder paths to change)"]])
     if bring:
-        ui.info("3. Take along archive folders:")
-        for rel, cmp in bring:
-            ui.info(f"     {rel}: {len(cmp.to_copy)} file(s) to copy "
-                    f"({ui.format_size(cmp.bytes_to_copy)}), {cmp.same} already on SSD")
-            _show_conflicts(cmp.conflicts, "Archive", "SSD")
-    ui.info(f"{'4' if bring else '3'}. Lock the PC catalog until it comes back "
-            f"(renamed to {cfg.catalog_name}{state.CHECKED_OUT_SUFFIX})")
+        steps.append(["Take along archive folders (whole folders, all files):"] +
+                     [f"   {rel}: {len(cmp.to_copy)} file(s) to copy "
+                      f"({ui.format_size(cmp.bytes_to_copy)}), {cmp.same} already on SSD"
+                      for rel, cmp in bring])
+    steps.append([f"Lock the PC catalog until it comes back "
+                  f"(renamed to {cfg.catalog_name}{state.CHECKED_OUT_SUFFIX})"])
+    for i, lines in enumerate(steps, 1):
+        ui.info(f"{i}. {lines[0]}")
+        for line in lines[1:]:
+            ui.info(f"   {line}")
+    for rel, cmp in bring:
+        _show_conflicts(cmp.conflicts, "Archive", "SSD")
 
     if dry_run:
         ui.info("\n  Dry run: nothing was changed.")
@@ -317,6 +418,12 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
         raise Abort("Cancelled. Nothing was changed.")
 
     # ---- do it (state changes only at the very end)
+    if remove_old:
+        errors = fsops.remove_cleanup(ssd.photos, cleanup)
+        for rel, err in errors[:10]:
+            ui.info(f"    Could not remove {rel}: {err}")
+        log.info("Removed %d file(s) not part of this trip from the SSD (%d errors)",
+                 sum(len(g.safe) for g in cleanup) - len(errors), len(errors))
     _copy_bring(cfg, ssd, bring)
     backup_pc_catalog(cfg, cfg.desktop_lrcat)
     stashed = stash_ssd_catalog(cfg, ssd)
@@ -466,7 +573,16 @@ def bring_folders(cfg: Config, folders: Optional[List[str]] = None, dry_run: boo
     ui.header("TAKE ALONG: copy archive folders to the SSD" + ("  [DRY RUN]" if dry_run else ""))
     ssd = require_ssd(cfg)
     if folders is None:
-        folders = ask_folders(cfg)
+        # Read the collection from wherever the catalog currently lives.
+        if state.is_out(state.read(cfg.desktop_catalog_dir)):
+            lrcat, root, cat_dir = ssd.lrcat, cfg.mac_root_lr, ssd.catalog_dir
+        else:
+            lrcat, root, cat_dir = cfg.desktop_lrcat, cfg.desktop_root_lr, cfg.desktop_catalog_dir
+        if lr.lock_files(cat_dir, cfg.catalog_name):
+            ui.warn("Lightroom has the catalog open, so its latest collection changes may not be "
+                    "visible yet.\nQuit Lightroom for an up-to-date list.")
+        suggested = folders_from_collection(cfg, lrcat, root)
+        folders = suggested if dry_run else ask_folders(cfg, suggested)
     if not folders:
         raise Abort("No folders chosen.")
     plans = _plan_bring(cfg, ssd, folders)

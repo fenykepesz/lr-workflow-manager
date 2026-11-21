@@ -216,3 +216,100 @@ def copy_files(items: List[FileItem], src_root: str, dst_root: str, label: str) 
 
 def free_space(path: str) -> int:
     return shutil.disk_usage(path).free
+
+
+# ---------------------------------------------------------------- SSD cleanup
+
+@dataclass
+class CleanupGroup:
+    """Files on the SSD under one folder that is not part of the current trip."""
+    folder: str                       # archive-relative folder shown to the user
+    files_only: bool = False          # True: loose files in a parent of a kept folder; keep the folder
+    safe: List[str] = field(default_factory=list)          # rel paths safely in the archive
+    safe_bytes: int = 0
+    unsafe: List[FileItem] = field(default_factory=list)   # kept: not (or not identically) in the archive
+
+
+def _is_under(rel: str, folder: str) -> bool:
+    r, f = rel.casefold(), folder.casefold()
+    return r == f or r.startswith(f + os.sep)
+
+
+def safe_in_archive(archive: str, rel: str, size: int, mtime: float) -> bool:
+    """True if the archive holds this file identically, or a newer version of it."""
+    try:
+        st = os.stat(os.path.join(archive, rel))
+    except FileNotFoundError:
+        return False
+    if st.st_size == size and abs(st.st_mtime - mtime) <= TIMESTAMP_TOLERANCE:
+        return True
+    return st.st_mtime > mtime + TIMESTAMP_TOLERANCE
+
+
+def plan_cleanup(ssd_photos: str, archive: str, keep: List[str],
+                 extra_skip: Iterable[str] = ()) -> List[CleanupGroup]:
+    """Group SSD files that are outside the `keep` folders, and mark which are safe to remove.
+
+    Groups are the highest folders that contain no kept folder, e.g. keeping
+    'Models\\Ira' groups 'Abroad' and 'Models\\Ivory Flame' separately.
+    """
+    keep = [os.path.normpath(k) for k in keep]
+    groups = {}
+    for rel, size, mtime in walk_files(ssd_photos, extra_skip):
+        if any(_is_under(rel, k) for k in keep):
+            continue
+        parts = rel.split(os.sep)[:-1]
+        group = None
+        for i in range(1, len(parts) + 1):
+            prefix = os.sep.join(parts[:i])
+            if not any(_is_under(k, prefix) for k in keep):
+                group = prefix
+                break
+        key = group or (os.path.dirname(rel) or ".")
+        g = groups.setdefault(key, CleanupGroup(key, files_only=group is None))
+        if safe_in_archive(archive, rel, size, mtime):
+            g.safe.append(rel)
+            g.safe_bytes += size
+        else:
+            try:
+                st = os.stat(os.path.join(archive, rel))
+                g.unsafe.append(FileItem(rel, size, mtime, st.st_size, st.st_mtime))
+            except FileNotFoundError:
+                g.unsafe.append(FileItem(rel, size, mtime))
+    return [groups[k] for k in sorted(groups, key=str.casefold)]
+
+
+def remove_cleanup(ssd_photos: str, groups: List[CleanupGroup]) -> List[Tuple[str, str]]:
+    """Delete the safe files, then leftover system junk and empty folders. Returns errors."""
+    errors = []
+    for g in groups:
+        for rel in g.safe:
+            try:
+                os.remove(os.path.join(ssd_photos, rel))
+            except OSError as e:
+                errors.append((rel, str(e)))
+        if g.files_only:
+            continue
+        base = os.path.join(ssd_photos, g.folder)
+        for dirpath, _, files in os.walk(base, topdown=False):
+            for f in files:
+                p = os.path.join(dirpath, f)
+                orphan_appledouble = f.startswith("._") and not os.path.exists(os.path.join(dirpath, f[2:]))
+                if orphan_appledouble:
+                    _try_remove(p)
+            remaining = os.listdir(dirpath)
+            if all(n.lower() in SKIP_FILE_NAMES for n in remaining):
+                for n in remaining:
+                    _try_remove(os.path.join(dirpath, n))
+                try:
+                    os.rmdir(dirpath)
+                except OSError:
+                    pass
+    return errors
+
+
+def _try_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
