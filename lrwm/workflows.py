@@ -14,7 +14,7 @@ from contextlib import closing
 from datetime import datetime
 from typing import List, Optional
 
-from . import drives, fsops, presets, situation, state, ui
+from . import drives, eject, fsops, presets, situation, state, ui
 from . import lightroom as lr
 from .config import Config
 
@@ -328,7 +328,7 @@ def _plan_presets(cfg: Config, ssd: drives.SSD, arriving: bool) -> Optional[pres
             return presets.plan_in(ssd.presets, cfg.adobe_dir, cfg.backup_dir)
         if not os.path.isdir(cfg.adobe_dir):
             return None
-        return presets.plan_out(cfg.adobe_dir, ssd.presets)
+        return presets.plan_out(cfg.adobe_dir, ssd.presets, cfg.backup_dir)
     except Exception as e:
         log.exception("Could not read presets")
         ui.warn(f"Could not read the Lightroom presets, so they will be skipped: {e}")
@@ -537,7 +537,8 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
     # Lightroom on the Mac upgraded the catalog into a new file?
     since = _since_ts(pc_state)
     newer = [f for f in os.listdir(ssd.catalog_dir)
-             if f.lower().endswith(".lrcat") and f != cfg.catalog_name + ".lrcat"
+             if f.lower().endswith(".lrcat") and not f.startswith("._")  # macOS metadata, not a catalog
+             and f != cfg.catalog_name + ".lrcat"
              and os.path.getmtime(os.path.join(ssd.catalog_dir, f)) > since]
     if newer:
         raise Abort("Lightroom on the Mac created a new catalog file: " + ", ".join(newer) + "\n"
@@ -552,6 +553,8 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
                or fsops.tree_fingerprint(ssd.lrcat + "-data") != pc_state.get("ssd_data_fingerprint"))
     photos = fsops.compare_trees(ssd.photos, cfg.desktop_photos, cfg.extra_skip_names)
     plan = _plan_readonly(ssd.lrcat, cfg.mac_root_lr, cfg.desktop_root_lr) if changed else None
+    smart_previews = os.path.join(cfg.desktop_catalog_dir, cfg.catalog_name + " Smart Previews.lrdata")
+    pc_only = lr.preview_pc_only(ssd.lrcat, locked, smart_previews) if changed else None
     preset_plan = _plan_presets(cfg, ssd, arriving=True)
 
     ui.info(f"Checked out:  {state.describe_since(pc_state)}")
@@ -569,15 +572,17 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
         ui.info(f"2. Copy the catalog back to {cfg.desktop_lrcat}")
         for line in lr.describe_plan(plan) or ["(no folder paths to change)"]:
             ui.info(f"     {line}")
+        for line in pc_only.describe():
+            ui.info(f"     {line}")
     else:
         ui.info("2. Unlock the PC catalog as it was (no edits to bring back)")
     ui.info(f"3. Mark the SSD copy as returned ({cfg.catalog_name}{state.RETURNED_SUFFIX})")
     if preset_plan:
         ui.info(f"4. Lightroom presets from the SSD: {preset_plan.describe()}")
-        for item in preset_plan.items[:5]:
+        for item in preset_plan.items[:10]:
             ui.info(f"     {item.rel}")
-        if len(preset_plan.items) > 5:
-            ui.info(f"     ... and {len(preset_plan.items) - 5} more")
+        if len(preset_plan.items) > 10:
+            ui.info(f"     ... and {len(preset_plan.items) - 10} more")
 
     if photos.to_copy:
         _check_space(cfg.desktop_photos, photos.bytes_to_copy, "archive drive")
@@ -598,10 +603,15 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
         log.info("Copied %d photo file(s) to archive", len(photos.to_copy))
 
     if changed:
+        def prepare(tmp: str) -> None:
+            lr.retarget_catalog(tmp, cfg.mac_root_lr, cfg.desktop_root_lr)
+            restored = lr.restore_pc_only(tmp, locked, smart_previews)
+            log.info("Kept from the PC catalog: %d Smart Preview record(s), %d setting(s)",
+                     len(restored.previews), len(restored.variables))
+
         progress = ui.Progress("Catalog ", os.path.getsize(ssd.lrcat))
-        fsops.copy_file_atomic(
-            ssd.lrcat, cfg.desktop_lrcat, verify=True, progress=progress,
-            before_commit=lambda tmp: lr.retarget_catalog(tmp, cfg.mac_root_lr, cfg.desktop_root_lr))
+        fsops.copy_file_atomic(ssd.lrcat, cfg.desktop_lrcat, verify=True, progress=progress,
+                               before_commit=prepare)
         progress.finish()
         if os.path.isdir(ssd.lrcat + "-data"):
             fsops.copy_dir_atomic(ssd.lrcat + "-data", cfg.desktop_lrcat + "-data")
@@ -690,6 +700,16 @@ def copy_photos(cfg: Config, dry_run: bool = False) -> None:
         ui.info(f"    ERROR {rel}: {err}")
     ui.info(f"Copied {len(cmp.to_copy) - len(errors)} file(s), {len(errors)} error(s).")
     log.info("Copy photos: %d copied, %d errors", len(cmp.to_copy) - len(errors), len(errors))
+
+
+def eject_ssd(cfg: Config) -> None:
+    ssd = require_ssd(cfg)
+    ui.info(f"Ejecting the SSD ({ssd.root})...")
+    try:
+        eject.eject(ssd.root, [cfg.desktop_catalog_dir, cfg.desktop_photos, cfg.backup_dir])
+    except eject.EjectError as e:
+        raise Abort(str(e))
+    ui.info("Ejected. You can unplug the SSD now.")
 
 
 def release(cfg: Config) -> None:

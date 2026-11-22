@@ -431,6 +431,74 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(os.path.exists(self.cfg.desktop_lrcat))
         self.assertFalse(os.path.exists(self.ssd_lrcat))
 
+    def test_arrive_ignores_mac_metadata_beside_catalog(self):
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        later = time.time() + 60
+        os.utime(self.ssd_lrcat, (later, later))
+        write(os.path.join(os.path.dirname(self.ssd_lrcat), "._Cat.lrcat"), b"apple", later)
+        self.answers = ["y"]
+        workflows.arrive(self.cfg)
+        self.assertTrue(os.path.exists(self.cfg.desktop_lrcat))
+
+    def test_arrive_still_refuses_upgraded_catalog(self):
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        write(os.path.join(os.path.dirname(self.ssd_lrcat), "Cat-v17.lrcat"), b"upgraded", time.time() + 60)
+        with self.assertRaises(workflows.Abort):
+            workflows.arrive(self.cfg)
+
+    def catalog_with_smart_previews(self):
+        previews = os.path.join(self.pc_cat_dir, "Cat Smart Previews.lrdata", "K")
+        write(os.path.join(previews, "KEEP.dng"))
+        write(os.path.join(previews, "REMOVED.dng"))
+        with closing(sqlite3.connect(self.cfg.desktop_lrcat)) as c:
+            c.execute("create table AgDNGProxyInfo (id_local integer primary key, fileUUID not null, "
+                      "status not null, statusDateTime not null)")
+            for i, uid in ((901, "KEEP"), (902, "NOFILE"), (903, "REMOVED")):
+                c.execute("insert into AgDNGProxyInfo values (?,?,'V','2026-01-01')", (i, uid))
+                c.execute("insert into AgLibraryFile (id_global, baseName) values (?,?)", (uid, uid))
+            for i, name in enumerate(lr.PC_ONLY_VARIABLES):
+                c.execute("insert into Adobe_variablesTable values (?,?,?,NULL,'pc')", (50 + i, f"g{i}", name))
+            c.commit()
+
+    def edit_on_mac(self, *statements):
+        with closing(sqlite3.connect(self.ssd_lrcat)) as c:
+            for sql in statements:
+                c.execute(sql)
+            c.commit()
+        later = time.time() + 60
+        os.utime(self.ssd_lrcat, (later, later))
+
+    def test_arrive_keeps_what_belongs_to_the_pc(self):
+        self.catalog_with_smart_previews()
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        self.edit_on_mac("delete from AgDNGProxyInfo",
+                         "delete from AgLibraryFile where id_global='REMOVED'",  # photo removed on the Mac
+                         "update Adobe_variablesTable set value='mac' where value='pc'",
+                         "insert into Adobe_variablesTable values (99, 'g99', 'Other', NULL, 'edit')")
+        self.answers = ["y"]
+        workflows.arrive(self.cfg)
+        with closing(sqlite3.connect(self.cfg.desktop_lrcat)) as c:
+            self.assertEqual(c.execute("select id_local, fileUUID, status from AgDNGProxyInfo").fetchall(),
+                             [(901, "KEEP", "V")])
+            self.assertEqual(c.execute("select count(*) from Adobe_variablesTable where value='pc'").fetchone()[0], 2)
+            self.assertEqual(c.execute("select value from Adobe_variablesTable where id_local=99").fetchone()[0], "edit")
+
+    def test_arrive_failing_to_restore_stays_checked_out(self):
+        self.catalog_with_smart_previews()
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        self.edit_on_mac("delete from AgDNGProxyInfo")
+        self.answers = ["y"]
+        with mock.patch.object(lr, "restore_pc_only", side_effect=lr.CatalogError("no")):
+            with self.assertRaises(lr.CatalogError):
+                workflows.arrive(self.cfg)
+        self.assertFalse(os.path.exists(self.cfg.desktop_lrcat))
+        self.assertTrue(os.path.exists(state.checked_out_path(self.pc_cat_dir, "Cat")))
+        self.assertTrue(os.path.exists(self.ssd_lrcat))
+
     def test_presets_round_trip(self):
         folder = os.path.join("CameraRaw", "Settings")
         pc = os.path.join(self.cfg.preset_adobe_dir, folder)
@@ -464,7 +532,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.ssd_root, "Presets")))
         self.answers = ["y"]
         workflows.leave(self.cfg, folders=[])
-        write(os.path.join(self.ssd_root, "Presets", "CameraRaw", "Settings", "b.xmp"))
+        write(os.path.join(self.ssd_root, "Presets", "CameraRaw", "Settings", "b.xmp"), b"other")
         workflows.arrive(self.cfg, dry_run=True)
         self.assertFalse(os.path.exists(os.path.join(pc, "b.xmp")))
 
@@ -505,11 +573,12 @@ class PresetTests(unittest.TestCase):
         self.pc, self.ssd, self.backup = (os.path.join(tmp.name, n) for n in ("pc", "ssd", "backup"))
         self.t = time.time() - 1000
 
-    def put(self, root, name, data=b"x", age=0, folder="CameraRaw/Settings"):
+    def put(self, root, name, data=None, age=0, folder="CameraRaw/Settings"):
+        data = name.encode() if data is None else data  # different presets, different content
         write(os.path.join(root, *folder.split("/"), name), data, self.t + age)
 
     def send(self):
-        presets.copy_out(presets.plan_out(self.pc, self.ssd), self.pc, self.ssd, self.backup)
+        presets.copy_out(presets.plan_out(self.pc, self.ssd, self.backup), self.pc, self.ssd, self.backup)
 
     def test_same_content_with_other_date_is_skipped(self):
         self.put(self.pc, "a.xmp")
@@ -520,12 +589,12 @@ class PresetTests(unittest.TestCase):
     def test_newer_destination_is_left_alone(self):
         self.put(self.pc, "a.xmp", b"old")
         self.put(self.ssd, "a.xmp", b"newer", 500)
-        plan = presets.plan_out(self.pc, self.ssd)
+        plan = presets.plan_out(self.pc, self.ssd, self.backup)
         self.assertEqual((plan.items, len(plan.conflicts)), ([], 1))
 
     def test_unicode_forms_are_one_preset(self):
-        self.put(self.pc, "Caf\u00e9.xmp")       # composed, as Windows writes it
-        self.put(self.ssd, "Cafe\u0301.xmp")     # decomposed, as a Mac may write it
+        self.put(self.pc, "Caf\u00e9.xmp", b"cafe")      # composed, as Windows writes it
+        self.put(self.ssd, "Cafe\u0301.xmp", b"cafe")    # decomposed, as a Mac may write it
         plan = presets.plan_in(self.ssd, self.pc, self.backup)
         self.assertEqual((plan.items, plan.same), ([], 1))
 
@@ -556,8 +625,62 @@ class PresetTests(unittest.TestCase):
         self.put(self.pc, "._a.xmp")
         self.put(self.pc, "notes.pdf")
         self.put(self.pc, "x.xmp", folder="Lightroom/Export Presets")
-        self.assertEqual([os.path.basename(i.rel) for i in presets.plan_out(self.pc, self.ssd).items],
+        self.assertEqual([os.path.basename(i.rel) for i in presets.plan_out(self.pc, self.ssd, self.backup).items],
                          ["b.lrtemplate"])
+
+    def xmp(self, text, uid="AB12"):
+        return f'<x crs:UUID="{uid}">{text}</x>\n'.encode()
+
+    def test_same_content_in_another_folder_is_not_duplicated(self):
+        self.put(self.pc, "a.xmp", b"same")
+        self.put(self.ssd, "a.xmp", b"same", folder="CameraRaw/ImportedSettings")
+        plan = presets.plan_in(self.ssd, self.pc, self.backup)
+        self.assertEqual((plan.items, len(plan.elsewhere)), ([], 1))
+        self.assertEqual(presets.plan_out(self.pc, self.ssd, self.backup).items, [])
+
+    def test_line_endings_are_not_a_change(self):
+        self.put(self.pc, "a.lrtemplate", b"one\r\ntwo\r\n")
+        self.put(self.ssd, "a.lrtemplate", b"one\ntwo\n", 500)
+        plan = presets.plan_in(self.ssd, self.pc, self.backup)
+        self.assertEqual((plan.items, plan.same), ([], 1))
+
+    def test_obsolete_templates_are_ignored(self):
+        self.put(self.ssd, "~~old.lrtemplate")
+        self.assertEqual(presets.plan_in(self.ssd, self.pc, self.backup).items, [])
+
+    def test_older_variant_in_another_folder_is_left_alone(self):
+        self.put(self.pc, "a.xmp", self.xmp("2018"), -9000)
+        self.put(self.ssd, "a.xmp", self.xmp("2026 conversion"), folder="CameraRaw/ImportedSettings")
+        self.assertEqual(presets.plan_in(self.ssd, self.pc, self.backup).items, [])  # never synced
+        presets.write_seen(self.backup, {})  # synced just now, after both were written
+        plan = presets.plan_in(self.ssd, self.pc, self.backup)
+        self.assertEqual((plan.items, len(plan.versions)), ([], 1))
+
+    def test_edit_in_another_folder_updates_the_preset_in_place(self):
+        self.put(self.pc, "a.xmp", self.xmp("old"))
+        presets.write_seen(self.backup, {})
+        self.put(self.ssd, "a.xmp", self.xmp("edited"), 5000, "CameraRaw/ImportedSettings")
+        plan = presets.plan_in(self.ssd, self.pc, self.backup)
+        self.assertEqual([i.rel for i in plan.items], [os.path.join("CameraRaw", "Settings", "a.xmp")])
+        self.assertEqual(presets.copy_in(plan, self.backup), [])
+        with open(os.path.join(self.pc, "CameraRaw", "Settings", "a.xmp"), "rb") as f:
+            self.assertEqual(f.read(), self.xmp("edited"))
+        self.assertTrue(os.listdir(os.path.join(self.backup, presets.BACKUP_DIR)))
+
+    def test_ambiguous_id_is_never_replaced(self):
+        self.put(self.pc, "a.xmp", self.xmp("one"))
+        self.put(self.pc, "b.xmp", self.xmp("two"))
+        presets.write_seen(self.backup, {})
+        self.put(self.ssd, "c.xmp", self.xmp("three"), 5000)
+        self.assertEqual(presets.plan_in(self.ssd, self.pc, self.backup).items, [])
+
+    def test_preset_deleted_on_pc_stays_deleted_when_ssd_has_it_elsewhere(self):
+        self.put(self.pc, "keep.xmp")
+        self.put(self.pc, "gone.xmp", b"gone")
+        self.send()
+        os.remove(os.path.join(self.pc, "CameraRaw", "Settings", "gone.xmp"))
+        self.put(self.ssd, "gone.xmp", b"gone", 500, "CameraRaw/ImportedSettings")
+        self.assertEqual(presets.plan_in(self.ssd, self.pc, self.backup).items, [])
 
     def test_mac_script_has_unix_line_endings(self):
         presets.install_mac_script(self.ssd)

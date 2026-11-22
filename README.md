@@ -80,10 +80,12 @@ Leave and Arrive also carry your Lightroom presets, through a `Presets` folder o
    It syncs both ways. Run it again before ejecting if you made presets on the laptop, otherwise they stay there.
 3. **Arrive** copies new and changed presets to the PC.
 
-- Newer wins, and identical files are skipped whatever their dates.
+- Presets are matched by path, by content and by preset ID, so one that lives in a different folder on each computer isn't duplicated. Line endings don't count.
+- Same path: newer wins. Same ID in another folder: replaced only if it was edited since the last sync. Otherwise they're older variants and both stay as they are.
+- Obsolete `~*.lrtemplate` files left by Lightroom 7.3's conversion are ignored.
 - Replaced presets are backed up: on the PC in `PresetBackups` inside `backup_dir`, on the Mac in `~/Library/Application Support/LRWM/PresetBackups`. These backups are not rotated.
 - Deletions aren't passed on. Delete a preset on each computer where you don't want it. A preset you deleted isn't restored by the copy on the SSD unless that copy was edited later.
-- A renamed preset counts as a new one, so the old name stays on the other computer.
+- A preset only moved to another folder isn't copied again.
 - A problem with presets is reported and never blocks the catalog.
 - **Not included:** Nik and other plug-in presets (use export and import inside the plug-in; Nik 7 keeps them in a database), camera and lens profiles, export presets, and preset favorites.
 - Keep Lightroom's *Store presets with this catalog* **off**. Presets stored that way are in a folder the tool doesn't copy.
@@ -101,6 +103,7 @@ To turn this off, set `"sync_presets": false`.
 - **Catches forgotten photos**: Leave warns if the SSD has photos that never made it into the archive.
 - **Wrong SSD, or a catalog upgraded on the laptop**: Arrive refuses if the SSD doesn't hold this checkout, or if Lightroom on the laptop upgraded the catalog to a newer version.
 - **Deliberate checkouts**: checking out or in needs a typed `y`, so repeated Enter presses can't lock the catalog.
+- **Safe eject**: only a removable device is ejected, never one that also carries another disk, Windows, the catalog, the archive or the backups. If the SSD is in use, it says so and doesn't force it.
 - **Dry run**: `--dry-run`, or `M` then `D` from the start screen, shows the full plan without changing anything.
 - **Emergency release**: if the SSD is lost, unlock the PC catalog as it was at checkout.
 - **Skips system junk**: macOS `._*` and `.DS_Store` files, Windows `Thumbs.db`, and Lightroom preview caches.
@@ -155,11 +158,11 @@ Run the tool. It works out where you are in the trip and suggests one step:
 |---|---|
 | Catalog at home | Starts Leave |
 | Catalog at home, but the SSD has files the archive doesn't | Starts Copy photos |
-| Catalog out, nothing changed since Leave | Quits: you're ready to travel (`A` cancels the trip with Arrive) |
+| Catalog out, nothing changed since Leave | Ejects the SSD and quits: you're ready to travel (`A` cancels the trip with Arrive) |
 | Catalog out, and the catalog, photos or presets on the SSD changed | Starts Arrive |
 | SSD missing, or not the one holding the checkout | Checks again, after saying what to connect |
 | Damaged or contradictory checkout records | Nothing, and explains the problem |
-| A Leave or Arrive has just finished | Quits |
+| A Leave or Arrive has just finished | Ejects the SSD and quits |
 
 It's only a suggestion: nothing starts until you press Enter, and checking the catalog out or in needs a typed `y`. Plain Enter at that question cancels.
 
@@ -172,6 +175,7 @@ It's only a suggestion: nothing starts until you press Enter, and checking the c
   [4] Copy photos  copy new photos from the SSD to the archive only
   [5] Status       details, backups, what's on the SSD
   [D] Dry run      show plans without changing anything
+  [E] Eject        safely eject the SSD
   [R] Emergency release   (only while checked out)
   [B] Back
 ```
@@ -192,7 +196,7 @@ python lr_workflow.py --copy-photos                    # (--sync still works)
 1. Connect the SSD and [sync the presets](#lightroom-presets). In Lightroom Classic, choose **File > Open Catalog** and pick `/Volumes/<SSD>/Catalog/<name>.lrcat`.
 2. Import new photos into `/Volumes/<SSD>/Photography/<trip folder>`.
 3. Edit, including Photoshop round-trips. The PSDs and TIFFs land next to the originals on the SSD.
-4. Quit Lightroom before ejecting the SSD. If you made presets, run the preset sync again first.
+4. Quit Lightroom, then run the preset sync again. When it has finished, type `y` to eject the SSD.
 
 ## What is copied
 
@@ -200,7 +204,9 @@ python lr_workflow.py --copy-photos                    # (--sync still works)
 |---|---|
 | `.lrcat` (the catalog) | Yes, checked against a checksum |
 | `.lrcat-data` (masks and AI edit data) | Yes |
-| `Previews.lrdata`, `Helper.lrdata`, `Smart Previews.lrdata` | No. These belong to each machine and Lightroom rebuilds them. |
+| `Previews.lrdata`, `Helper.lrdata` | No. These belong to each machine and Lightroom rebuilds them. |
+| `Smart Previews.lrdata` | No, they stay on the PC. Lightroom on the laptop deletes their records from the catalog, so Arrive puts those back from the PC's locked catalog. Lightroom would **not** rebuild them by itself. |
+| PC-only catalog settings (backup folder, XMP auto-write block) | Arrive keeps the PC's values. |
 | Lightroom presets | Yes, new and changed ones. See [Lightroom presets](#lightroom-presets). |
 | Photos | Leave: only the folders you choose. Arrive: everything on the SSD that's new or newer than the archive. |
 

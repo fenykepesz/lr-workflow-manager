@@ -3,7 +3,7 @@
 import argparse
 import sys
 
-from . import __version__, situation, state, ui, workflows
+from . import __version__, drives, situation, state, ui, workflows
 from .config import ConfigError, load_config
 
 
@@ -53,18 +53,21 @@ def start(cfg, dry_run: bool = False) -> None:
             enter = None  # a menu key, "quit", "again", or None for nothing
             if finished and now.kind != situation.PROBLEM:
                 ui.info(finished)
-                enter, label = "quit", "Quit"
+                if now.kind == situation.NO_SSD:
+                    enter, label = "quit", "Quit"
+                else:
+                    enter, label = "E", "Eject the SSD and quit"
             elif now.kind in SUGGESTED:
                 enter, label = SUGGESTED[now.kind]
             elif now.kind == situation.READY:
-                enter, label = "quit", "Quit"
+                enter, label = "E", "Eject the SSD and quit"
             elif now.kind in (situation.NO_SSD, situation.WRONG_SSD):
                 enter, label = "again", "Check again"
             if enter:
                 ui.info(f"[Enter] {label}")
             if now.kind == situation.READY:
                 ui.info("[A] Trip cancelled: Arrive")
-            ui.info("[M] More options     [Q] Quit")
+            ui.info("[M] More options     [Q] Quit" + (" without ejecting" if enter == "E" else ""))
 
             choice = ui.ask("\n  Choose: ").upper()
             if choice == "Q" or (not choice and enter == "quit"):
@@ -85,6 +88,13 @@ def start(cfg, dry_run: bool = False) -> None:
             else:
                 continue
 
+            if key == "E":
+                ejected = _run(workflows.eject_ssd, cfg)
+                ui.pause()  # keep the result readable: the shortcut's window closes on quit
+                if ejected:
+                    return
+                continue
+
             finished = None
             if key == "5":
                 _run(workflows.status, cfg)
@@ -93,7 +103,7 @@ def start(cfg, dry_run: bool = False) -> None:
             else:
                 ok = _run(getattr(workflows, PROCEDURES[key]), cfg, dry_run=dry_run)
                 if ok and not dry_run and key in ("1", "2"):
-                    finished = ("Done. Eject the SSD before you unplug it." if key == "1"
+                    finished = ("Done. The SSD is ready for the trip." if key == "1"
                                 else "Done. You can open Lightroom on this PC.")
             ui.pause()
     except (EOFError, KeyboardInterrupt):
@@ -113,6 +123,8 @@ def menu(cfg, now: situation.Situation, dry_run: bool) -> str:
         ("5", "Status", "details, backups, what's on the SSD"),
         ("D", "Dry run", f"show plans without changing anything (now {'ON' if dry_run else 'OFF'})"),
     ]
+    if drives.connect(cfg):
+        options.append(("E", "Eject", "safely eject the SSD"))
     if out:
         options.append(("R", "Emergency release", "unlock the PC catalog without the SSD"))
     options += [("B", "Back", ""), ("Q", "Quit", "")]

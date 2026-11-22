@@ -245,6 +245,93 @@ def retarget_catalog(path: str, old_prefix: str, new_prefix: str) -> RetargetPla
         conn.close()
 
 
+# ------------------------------------------------- what belongs to the PC
+
+# Catalog variables that only make sense on the PC. The laptop's values must not come home.
+PC_ONLY_VARIABLES = ("AgLibrary_BackupPathToFolder", "AgMetadata_autoWriteXmpBlocked")
+
+
+@dataclass
+class PCOnlyPlan:
+    previews: List[tuple] = field(default_factory=list)   # (id_local, fileUUID, status, statusDateTime)
+    variables: List[tuple] = field(default_factory=list)  # (name, PC value, PC has it)
+
+    @property
+    def empty(self) -> bool:
+        return not (self.previews or self.variables)
+
+    def describe(self) -> List[str]:
+        lines = []
+        if self.previews:
+            lines.append(f"Keep the PC's {len(self.previews)} Smart Preview record(s)")
+        if self.variables:
+            lines.append(f"Keep {len(self.variables)} PC-only catalog setting(s), e.g. the backup folder")
+        return lines
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return bool(conn.execute("select 1 from sqlite_master where type='table' and name=?", (name,)).fetchone())
+
+
+def plan_pc_only(conn: sqlite3.Connection, pc: sqlite3.Connection, smart_previews: str) -> PCOnlyPlan:
+    """What to carry over from the PC's catalog into the one coming home.
+
+    Lightroom on the laptop deletes the records of Smart Previews it can't find,
+    and those files stay on the PC. A record is put back if its file is still
+    there and its photo is still in the catalog.
+    """
+    plan = PCOnlyPlan()
+    table = "AgDNGProxyInfo"
+    if os.path.isdir(smart_previews) and _has_table(conn, table) and _has_table(pc, table):
+        on_disk = {os.path.splitext(f)[0].upper()
+                   for _, _, files in os.walk(smart_previews) for f in files}
+        sql = f"select id_local, fileUUID, status, statusDateTime from {table}"
+        now = {(row[1], row[2]) for row in conn.execute(sql)}
+        photos = {u for (u,) in conn.execute("select id_global from AgLibraryFile")}
+        plan.previews = [row for row in pc.execute(sql)
+                         if row[1].upper() in on_disk and row[1] in photos and (row[1], row[2]) not in now]
+    for name in PC_ONLY_VARIABLES:
+        sql = "select value from Adobe_variablesTable where name=?"
+        ours, theirs = pc.execute(sql, (name,)).fetchone(), conn.execute(sql, (name,)).fetchone()
+        if theirs is not None and ours != theirs:
+            plan.variables.append((name, ours[0] if ours else None, ours is not None))
+    return plan
+
+
+def preview_pc_only(path: str, pc_catalog: str, smart_previews: str) -> PCOnlyPlan:
+    with closing(_ro(path)) as conn, closing(_ro(pc_catalog)) as pc:
+        return plan_pc_only(conn, pc, smart_previews)
+
+
+def restore_pc_only(path: str, pc_catalog: str, smart_previews: str) -> PCOnlyPlan:
+    """Apply plan_pc_only to the catalog file at `path` (must be a copy, Lightroom closed)."""
+    with closing(sqlite3.connect(path, isolation_level=None)) as conn, closing(_ro(pc_catalog)) as pc:
+        plan = plan_pc_only(conn, pc, smart_previews)
+        if plan.empty:
+            return plan
+        conn.execute("begin immediate")
+        try:
+            for row in plan.previews:
+                conn.execute("delete from AgDNGProxyInfo where fileUUID=?", (row[1],))
+                taken = conn.execute("select 1 from AgDNGProxyInfo where id_local=?", (row[0],)).fetchone()
+                if taken:
+                    raise CatalogError("A Smart Preview record's ID is used by another photo in the returning catalog.")
+                conn.execute("insert into AgDNGProxyInfo (id_local, fileUUID, status, statusDateTime) "
+                             "values (?,?,?,?)", row)
+            for name, value, present in plan.variables:
+                if present:
+                    conn.execute("update Adobe_variablesTable set value=? where name=?", (value, name))
+                else:
+                    conn.execute("delete from Adobe_variablesTable where name=?", (name,))
+            conn.execute("commit")
+        except BaseException:
+            conn.execute("rollback")
+            raise
+        if not integrity_ok(conn):
+            raise CatalogError("Catalog failed the integrity check after restoring the PC's records.")
+        return plan
+
+
 def describe_plan(plan: RetargetPlan) -> List[str]:
     lines = []
     for _, old, new in plan.renames:

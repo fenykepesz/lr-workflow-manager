@@ -41,6 +41,9 @@ class Base(unittest.TestCase):
                                  side_effect=lambda *a, **k: self.shown.append(" ".join(map(str, a))))):
             patch.start()
             self.addCleanup(patch.stop)
+        patch = mock.patch("lrwm.eject.eject")  # no test may eject a real drive
+        self.eject = patch.start()
+        self.addCleanup(patch.stop)
 
     def answer(self, prompt):
         if not self.answers:
@@ -213,8 +216,9 @@ class ScreenTests(Base):
 
     def test_enter_leaves_then_enter_quits(self):
         # start Leave, no folders, confirm, pause, quit
-        self.run_screen("", "", "y", "", "")
+        self.run_screen("", "", "y", "", "", "")  # ... pause, eject, pause
         self.assertTrue(self.is_out())
+        self.eject.assert_called_once()
 
     def test_only_pressing_enter_never_checks_out(self):
         self.answers = [""] * 20
@@ -222,21 +226,23 @@ class ScreenTests(Base):
             cli.start(self.cfg)
         self.assertFalse(self.is_out())
 
-    def test_ready_enter_quits(self):
+    def test_ready_enter_ejects_and_quits(self):
         self.leave()
-        self.run_screen("")
+        self.run_screen("", "")
+        self.eject.assert_called_once()
         self.assertTrue(self.is_out())
 
     def test_ready_a_cancels_the_trip_then_enter_quits(self):
         self.leave()
-        self.run_screen("a", "y", "", "")
+        self.run_screen("a", "y", "", "", "")
         self.assertFalse(self.is_out())
 
     def test_enter_arrives_then_enter_quits(self):
         self.leave()
         self.photo()
-        self.run_screen("", "y", "", "")
+        self.run_screen("", "y", "", "", "")
         self.assertFalse(self.is_out())
+        self.eject.assert_called_once()
         self.assertTrue(os.path.exists(os.path.join(self.cfg.desktop_photos, "Trip", "trip.raf")))
 
     def test_enter_at_arrive_confirmation_cancels(self):
@@ -274,6 +280,32 @@ class ScreenTests(Base):
     def test_dry_run_from_more_options(self):
         self.run_screen("m", "d", "", "", "q")  # toggle, start Leave, pause, quit
         self.assertFalse(self.is_out())
+
+    def test_quit_does_not_eject(self):
+        self.leave()
+        self.run_screen("q")
+        self.eject.assert_not_called()
+
+    def test_failed_eject_stays_open_to_retry(self):
+        from lrwm.eject import EjectError
+        self.leave()
+        self.eject.side_effect = [EjectError("in use"), None]
+        self.run_screen("", "", "", "")  # fails, pause, retry, pause
+        self.assertEqual(self.eject.call_count, 2)
+        self.assertTrue(self.is_out())
+
+    def test_eject_from_more_options(self):
+        self.run_screen("m", "e", "")
+        self.eject.assert_called_once()
+        self.assertFalse(self.is_out())
+
+    def test_already_unplugged_after_leave_just_quits(self):
+        self.answers = ["", "", "y", "", ""]
+        real = situation.detect(self.cfg)
+        gone = situation.Situation(situation.NO_SSD, "SSD not connected.")
+        with mock.patch.object(situation, "detect", side_effect=[real, gone]):
+            cli.start(self.cfg)
+        self.eject.assert_not_called()
 
     def test_end_of_input_exits(self):
         with mock.patch.object(ui, "ask", side_effect=EOFError):
