@@ -26,6 +26,8 @@ class Config:
     ssd_catalog_subdir: str = "Catalog"
     mac_volume_name: str = ""           # defaults to ssd_label
     take_along_collection: str = "Take along"  # Lightroom collection marking folders to take
+    sync_presets: bool = True           # carry Lightroom presets at Leave and Arrive
+    preset_adobe_dir: str = ""          # defaults to %APPDATA%\Adobe
     keep_backups: int = 5
     keep_ssd_backups: int = 2
     extra_skip_names: List[str] = field(default_factory=list)
@@ -39,6 +41,14 @@ class Config:
     def desktop_root_lr(self) -> str:
         """The photo archive path the way Lightroom stores it on Windows: 'E:/Photography/'."""
         return to_lr_path(self.desktop_photos)
+
+    @property
+    def adobe_dir(self) -> str:
+        """The folder holding Lightroom's and Camera Raw's preset folders, or '' if unknown."""
+        if self.preset_adobe_dir:
+            return self.preset_adobe_dir
+        appdata = os.environ.get("APPDATA")
+        return os.path.join(appdata, "Adobe") if appdata else ""
 
     @property
     def mac_root_lr(self) -> str:

@@ -62,6 +62,34 @@ Photos stay on the SSD between trips; Arrive never removes anything. At each **L
 
 A file is only removed if the archive holds the same file, or a newer version of it. Anything else stays on the SSD and is listed. This keeps old versions off the laptop, and stops photos you deleted at home from being copied back by the next Arrive.
 
+### Lightroom presets
+
+Leave and Arrive also carry your Lightroom presets, through a `Presets` folder on the SSD:
+
+| Preset folder (under the Adobe settings folder) | Holds |
+|---|---|
+| `CameraRaw/Settings` | Develop presets and looks |
+| `CameraRaw/ImportedSettings` | Imported presets and looks |
+| `Lightroom/Local Adjustment Presets` | Brush and mask presets |
+
+1. **Leave** copies new and changed presets to the SSD and puts `Sync Presets.command` next to them.
+2. **On the laptop**, quit Lightroom and run the script (change `TravelSSD` to your SSD's name):
+   ```bash
+   bash "/Volumes/TravelSSD/Presets/Sync Presets.command"
+   ```
+   It syncs both ways. Run it again before ejecting if you made presets on the laptop, otherwise they stay there.
+3. **Arrive** copies new and changed presets to the PC.
+
+- Newer wins, and identical files are skipped whatever their dates.
+- Replaced presets are backed up: on the PC in `PresetBackups` inside `backup_dir`, on the Mac in `~/Library/Application Support/LRWM/PresetBackups`. These backups are not rotated.
+- Deletions aren't passed on. Delete a preset on each computer where you don't want it. A preset you deleted isn't restored by the copy on the SSD unless that copy was edited later.
+- A renamed preset counts as a new one, so the old name stays on the other computer.
+- A problem with presets is reported and never blocks the catalog.
+- **Not included:** Nik and other plug-in presets (use export and import inside the plug-in; Nik 7 keeps them in a database), camera and lens profiles, export presets, and preset favorites.
+- Keep Lightroom's *Store presets with this catalog* **off**. Presets stored that way are in a folder the tool doesn't copy.
+
+To turn this off, set `"sync_presets": false`.
+
 ## Safety features
 
 - **Lightroom must be closed**: the tool checks both the running program and the catalog's lock and journal files (`.lrcat.lock`, `-wal`, `-shm`, `-journal`) on the PC and on the SSD.
@@ -81,7 +109,7 @@ A file is only removed if the archive holds the same file, or a newer version of
 - Python 3.8+ on the Windows PC, with nothing else to install.
 - An SSD formatted as **exFAT**, so both Windows and macOS can read and write it.
 - **The same Lightroom Classic version on both computers.** A newer version upgrades the catalog, and then the older one can't open it.
-- Install your plugins and presets on both machines. They live in each machine's Lightroom settings, not in the catalog.
+- Install your plugins and camera profiles on both machines. The tool carries [Lightroom presets](#lightroom-presets), but not plugins, their presets, or profiles.
 
 ## Setup
 
@@ -89,6 +117,7 @@ A file is only removed if the archive holds the same file, or a newer version of
    ```
    SSD (named e.g. "TravelSSD")
    ├── Catalog\        ← the tool puts the catalog here
+   ├── Presets\        ← created by the tool at Leave
    └── Photography\    ← photos; mirrors the structure of your archive
    ```
 2. Copy `config.example.json` to `config.json` and fill it in:
@@ -103,6 +132,8 @@ A file is only removed if the archive holds the same file, or a newer version of
    | `ssd_fallback_drive` | Drive letter to try if no drive has that name |
    | `mac_volume_name` | The SSD's name on the Mac, if different from `ssd_label` |
    | `take_along_collection` | Lightroom collection marking folders to take along (default `Take along`) |
+   | `sync_presets` | Carry Lightroom presets at Leave and Arrive (default `true`) |
+   | `preset_adobe_dir` | Adobe settings folder, if not `%APPDATA%\Adobe` |
    | `keep_backups` / `keep_ssd_backups` | How many backups to keep |
 
    `config.json` is listed in `.gitignore`, so your paths stay private.
@@ -133,10 +164,10 @@ python lr_workflow.py --copy-photos                    # (--sync still works)
 
 ### On the laptop
 
-1. Connect the SSD. In Lightroom Classic, choose **File > Open Catalog** and pick `/Volumes/<SSD>/Catalog/<name>.lrcat`.
+1. Connect the SSD and [sync the presets](#lightroom-presets). In Lightroom Classic, choose **File > Open Catalog** and pick `/Volumes/<SSD>/Catalog/<name>.lrcat`.
 2. Import new photos into `/Volumes/<SSD>/Photography/<trip folder>`.
 3. Edit, including Photoshop round-trips. The PSDs and TIFFs land next to the originals on the SSD.
-4. Quit Lightroom before ejecting the SSD.
+4. Quit Lightroom before ejecting the SSD. If you made presets, run the preset sync again first.
 
 ## What is copied
 
@@ -145,6 +176,7 @@ python lr_workflow.py --copy-photos                    # (--sync still works)
 | `.lrcat` (the catalog) | Yes, checked against a checksum |
 | `.lrcat-data` (masks and AI edit data) | Yes |
 | `Previews.lrdata`, `Helper.lrdata`, `Smart Previews.lrdata` | No. These belong to each machine and Lightroom rebuilds them. |
+| Lightroom presets | Yes, new and changed ones. See [Lightroom presets](#lightroom-presets). |
 | Photos | Leave: only the folders you choose. Arrive: everything on the SSD that's new or newer than the archive. |
 
 Nothing is ever deleted from the archive.

@@ -13,6 +13,7 @@
   "mac_volume_name": "",
 
   "take_along_collection": "Take along",
+  "sync_presets": true,
   "keep_backups": 5,
   "keep_ssd_backups": 2
 }

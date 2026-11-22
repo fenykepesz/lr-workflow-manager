@@ -13,9 +13,19 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lrwm import fsops, state, ui, workflows  # noqa: E402
+from lrwm import fsops, presets, state, ui, workflows  # noqa: E402
 from lrwm import lightroom as lr  # noqa: E402
 from lrwm.config import Config, load_config, ConfigError  # noqa: E402
+
+
+def setUpModule():
+    """Never let a test reach the real Lightroom presets."""
+    fake = tempfile.TemporaryDirectory()
+    env = mock.patch.dict(os.environ, {"APPDATA": fake.name})
+    env.start()
+    unittest.addModuleCleanup(fake.cleanup)
+    unittest.addModuleCleanup(env.stop)
+
 
 WIN_ROOT = "E:/Photography/"
 MAC_ROOT = "/Volumes/TravelSSD/Photography/"
@@ -275,7 +285,8 @@ class WorkflowTests(unittest.TestCase):
         os.makedirs(os.path.join(self.ssd_root, "Photography"))
         self.cfg = Config(catalog_name="Cat", desktop_catalog_dir=self.pc_cat_dir,
                           desktop_photos=self.archive, backup_dir=os.path.join(base, "pc", "Backups"),
-                          ssd_root=self.ssd_root, ssd_label="TravelSSD")
+                          ssd_root=self.ssd_root, ssd_label="TravelSSD",
+                          preset_adobe_dir=os.path.join(base, "pc", "Adobe"))
         # Archive root as Lightroom would store it for this temp path
         self.win_root = self.cfg.desktop_root_lr
         os.makedirs(self.pc_cat_dir)
@@ -419,6 +430,141 @@ class WorkflowTests(unittest.TestCase):
         workflows.release(self.cfg)
         self.assertTrue(os.path.exists(self.cfg.desktop_lrcat))
         self.assertFalse(os.path.exists(self.ssd_lrcat))
+
+    def test_presets_round_trip(self):
+        folder = os.path.join("CameraRaw", "Settings")
+        pc = os.path.join(self.cfg.preset_adobe_dir, folder)
+        ssd = os.path.join(self.ssd_root, "Presets", folder)
+        t = time.time() - 1000
+        for name in ("edit.xmp", "gone.xmp", "Index.dat"):
+            write(os.path.join(pc, name), b"pc", t)
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        self.assertEqual(sorted(os.listdir(ssd)), ["edit.xmp", "gone.xmp"])
+        self.assertTrue(os.path.exists(os.path.join(self.ssd_root, "Presets", presets.MAC_SCRIPT)))
+
+        write(os.path.join(ssd, "edit.xmp"), b"mac edit", t + 100)
+        write(os.path.join(ssd, "new.xmp"), b"mac new")
+        os.remove(os.path.join(pc, "gone.xmp"))
+        self.answers = ["y"]
+        workflows.arrive(self.cfg)
+        with open(os.path.join(pc, "edit.xmp"), "rb") as f:
+            self.assertEqual(f.read(), b"mac edit")
+        self.assertTrue(os.path.exists(os.path.join(pc, "new.xmp")))
+        self.assertFalse(os.path.exists(os.path.join(pc, "gone.xmp")))
+        saved = os.path.join(self.cfg.backup_dir, presets.BACKUP_DIR)
+        (only,) = os.listdir(saved)
+        with open(os.path.join(saved, only, folder, "edit.xmp"), "rb") as f:
+            self.assertEqual(f.read(), b"pc")
+
+    def test_dry_runs_leave_presets_untouched(self):
+        pc = os.path.join(self.cfg.preset_adobe_dir, "CameraRaw", "Settings")
+        write(os.path.join(pc, "a.xmp"))
+        workflows.leave(self.cfg, folders=[], dry_run=True)
+        self.assertFalse(os.path.exists(os.path.join(self.ssd_root, "Presets")))
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        write(os.path.join(self.ssd_root, "Presets", "CameraRaw", "Settings", "b.xmp"))
+        workflows.arrive(self.cfg, dry_run=True)
+        self.assertFalse(os.path.exists(os.path.join(pc, "b.xmp")))
+
+    def test_sync_presets_off(self):
+        write(os.path.join(self.cfg.preset_adobe_dir, "CameraRaw", "Settings", "a.xmp"))
+        self.cfg.sync_presets = False
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[])
+        self.assertFalse(os.path.exists(os.path.join(self.ssd_root, "Presets")))
+
+    def test_preset_failures_never_block_the_catalog(self):
+        write(os.path.join(self.cfg.preset_adobe_dir, "CameraRaw", "Settings", "a.xmp"))
+        with mock.patch.object(presets, "copy_out", side_effect=OSError("disk")):
+            self.answers = ["y"]
+            workflows.leave(self.cfg, folders=[])
+        self.assertTrue(os.path.exists(self.ssd_lrcat))
+        os.makedirs(os.path.join(self.ssd_root, "Presets"))
+        with mock.patch.object(presets, "plan_in", side_effect=ValueError("bad record")):
+            self.answers = ["y"]
+            workflows.arrive(self.cfg)
+        self.assertTrue(os.path.exists(self.cfg.desktop_lrcat))
+
+    def test_cleanup_never_touches_presets(self):
+        kept = os.path.join(self.ssd_root, "Presets", "CameraRaw", "Settings", "mac.xmp")
+        write(kept)
+        t = time.time() - 500
+        write(os.path.join(self.archive, "Old", "p.raf"), b"p", t)
+        write(os.path.join(self.ssd_root, "Photography", "Old", "p.raf"), b"p", t)
+        self.answers = ["y", "y"]
+        workflows.leave(self.cfg, folders=[])
+        self.assertTrue(os.path.exists(kept))
+
+
+class PresetTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.pc, self.ssd, self.backup = (os.path.join(tmp.name, n) for n in ("pc", "ssd", "backup"))
+        self.t = time.time() - 1000
+
+    def put(self, root, name, data=b"x", age=0, folder="CameraRaw/Settings"):
+        write(os.path.join(root, *folder.split("/"), name), data, self.t + age)
+
+    def send(self):
+        presets.copy_out(presets.plan_out(self.pc, self.ssd), self.pc, self.ssd, self.backup)
+
+    def test_same_content_with_other_date_is_skipped(self):
+        self.put(self.pc, "a.xmp")
+        self.put(self.ssd, "a.xmp", age=500)
+        plan = presets.plan_in(self.ssd, self.pc, self.backup)
+        self.assertEqual((plan.items, plan.same), ([], 1))
+
+    def test_newer_destination_is_left_alone(self):
+        self.put(self.pc, "a.xmp", b"old")
+        self.put(self.ssd, "a.xmp", b"newer", 500)
+        plan = presets.plan_out(self.pc, self.ssd)
+        self.assertEqual((plan.items, len(plan.conflicts)), ([], 1))
+
+    def test_unicode_forms_are_one_preset(self):
+        self.put(self.pc, "Caf\u00e9.xmp")       # composed, as Windows writes it
+        self.put(self.ssd, "Cafe\u0301.xmp")     # decomposed, as a Mac may write it
+        plan = presets.plan_in(self.ssd, self.pc, self.backup)
+        self.assertEqual((plan.items, plan.same), ([], 1))
+
+    def test_deleted_preset_returns_only_if_edited_later(self):
+        self.put(self.pc, "keep.xmp")
+        self.put(self.pc, "gone.xmp")
+        self.send()
+        os.remove(os.path.join(self.pc, "CameraRaw", "Settings", "gone.xmp"))
+        self.send()  # a second trip must not forget the deletion
+        self.assertEqual(len(presets.plan_in(self.ssd, self.pc, self.backup).deleted), 1)
+        self.put(self.ssd, "gone.xmp", b"edited", 500)
+        self.assertEqual(len(presets.plan_in(self.ssd, self.pc, self.backup).items), 1)
+
+    def test_preset_never_on_pc_survives_another_leave(self):
+        self.put(self.pc, "a.xmp")
+        self.put(self.ssd, "mac.xmp")
+        self.send()
+        self.assertEqual(len(presets.plan_in(self.ssd, self.pc, self.backup).items), 1)
+
+    def test_empty_pc_gets_everything_back(self):
+        self.put(self.pc, "a.xmp")
+        self.send()
+        os.remove(os.path.join(self.pc, "CameraRaw", "Settings", "a.xmp"))
+        self.assertEqual(len(presets.plan_in(self.ssd, self.pc, self.backup).items), 1)
+
+    def test_only_preset_folders_and_types_are_copied(self):
+        self.put(self.pc, "b.lrtemplate", folder="Lightroom/Local Adjustment Presets")
+        self.put(self.pc, "._a.xmp")
+        self.put(self.pc, "notes.pdf")
+        self.put(self.pc, "x.xmp", folder="Lightroom/Export Presets")
+        self.assertEqual([os.path.basename(i.rel) for i in presets.plan_out(self.pc, self.ssd).items],
+                         ["b.lrtemplate"])
+
+    def test_mac_script_has_unix_line_endings(self):
+        presets.install_mac_script(self.ssd)
+        with open(os.path.join(self.ssd, presets.MAC_SCRIPT), "rb") as f:
+            body = f.read()
+        self.assertTrue(body.startswith(b"#!/bin/bash\n"))
+        self.assertNotIn(b"\r", body)
 
 
 class ConfigTests(unittest.TestCase):

@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 from .config import Config
+from .presets import SSD_DIR as PRESETS_DIR
 
 
 def find_drive_by_label(label: str) -> Optional[str]:
@@ -51,6 +52,7 @@ class SSD:
         self.photos = os.path.join(root, cfg.ssd_photos_subdir)
         self.catalog_dir = os.path.join(root, cfg.ssd_catalog_subdir)
         self.lrcat = os.path.join(self.catalog_dir, cfg.catalog_name + ".lrcat")
+        self.presets = os.path.join(root, PRESETS_DIR)
         self.backup_dir = os.path.join(self.catalog_dir, "LRWM-Backups")
 
 

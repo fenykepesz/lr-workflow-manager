@@ -14,7 +14,7 @@ from contextlib import closing
 from datetime import datetime
 from typing import List, Optional
 
-from . import drives, fsops, state, ui
+from . import drives, fsops, presets, state, ui
 from . import lightroom as lr
 from .config import Config
 
@@ -327,6 +327,46 @@ def _copy_bring(cfg: Config, ssd: drives.SSD, plans) -> None:
         raise Abort(f"{len(errors)} file(s) could not be copied to the SSD. Nothing was checked out.")
 
 
+def _plan_presets(cfg: Config, ssd: drives.SSD, arriving: bool) -> Optional[presets.Plan]:
+    """Presets are a convenience: a problem with them is reported and never blocks the catalog."""
+    if not cfg.sync_presets or not cfg.adobe_dir:
+        return None
+    try:
+        if arriving:
+            if not os.path.isdir(ssd.presets):
+                return None
+            return presets.plan_in(ssd.presets, cfg.adobe_dir, cfg.backup_dir)
+        if not os.path.isdir(cfg.adobe_dir):
+            return None
+        return presets.plan_out(cfg.adobe_dir, ssd.presets)
+    except Exception as e:
+        log.exception("Could not read presets")
+        ui.warn(f"Could not read the Lightroom presets, so they will be skipped: {e}")
+        return None
+
+
+def _copy_presets(cfg: Config, ssd: drives.SSD, plan: Optional[presets.Plan], arriving: bool) -> bool:
+    """True if the presets were handled without errors."""
+    if plan is None:
+        return False
+    try:
+        if arriving:
+            errors = presets.copy_in(plan, cfg.backup_dir)
+        else:
+            errors = presets.copy_out(plan, cfg.adobe_dir, ssd.presets, cfg.backup_dir)
+    except Exception as e:
+        log.exception("Could not copy presets")
+        ui.warn(f"Could not copy the Lightroom presets: {e}\nThe catalog is not affected.")
+        return False
+    if errors:
+        ui.warn(f"{len(errors)} preset(s) could not be copied. The catalog is not affected.")
+        for rel, err in errors[:5]:
+            ui.info(f"    ERROR {rel}: {err}")
+    log.info("Presets %s: %d copied, %d errors", "in" if arriving else "out",
+             len(plan.items) - len(errors), len(errors))
+    return not errors
+
+
 # ================================================================ LEAVE
 
 def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = False) -> None:
@@ -384,7 +424,9 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
     data_dir = cfg.desktop_lrcat + "-data"
     catalog_bytes = os.path.getsize(cfg.desktop_lrcat) + (fsops.tree_size(data_dir) if os.path.isdir(data_dir) else 0)
     bring_bytes = sum(c.bytes_to_copy for _, c in bring)
-    _check_space(ssd.root, max(catalog_bytes + bring_bytes - freed, 0), "SSD")
+    preset_plan = _plan_presets(cfg, ssd, arriving=False)
+    preset_bytes = preset_plan.bytes_to_copy if preset_plan else 0
+    _check_space(ssd.root, max(catalog_bytes + bring_bytes + preset_bytes - freed, 0), "SSD")
     _check_space(cfg.backup_dir if os.path.isdir(cfg.backup_dir) else cfg.desktop_catalog_dir,
                  catalog_bytes, "backup drive")
 
@@ -402,6 +444,8 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
                      [f"   {rel}: {len(cmp.to_copy)} file(s) to copy "
                       f"({ui.format_size(cmp.bytes_to_copy)}), {cmp.same} already on SSD"
                       for rel, cmp in bring])
+    if preset_plan:
+        steps.append([f"Copy Lightroom presets to {ssd.presets}", f"   {preset_plan.describe()}"])
     steps.append([f"Lock the PC catalog until it comes back "
                   f"(renamed to {cfg.catalog_name}{state.CHECKED_OUT_SUFFIX})"])
     for i, lines in enumerate(steps, 1):
@@ -425,6 +469,7 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
         log.info("Removed %d file(s) not part of this trip from the SSD (%d errors)",
                  sum(len(g.safe) for g in cleanup) - len(errors), len(errors))
     _copy_bring(cfg, ssd, bring)
+    presets_ok = _copy_presets(cfg, ssd, preset_plan, arriving=False)
     backup_pc_catalog(cfg, cfg.desktop_lrcat)
     stashed = stash_ssd_catalog(cfg, ssd)
     if stashed:
@@ -460,6 +505,12 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
             f"{cfg.mac_root_lr.rsplit('/', 2)[0]}/{cfg.ssd_catalog_subdir}/{cfg.catalog_name}.lrcat")
     ui.info(f"  3. Import new photos into {cfg.mac_root_lr}<trip folder>")
     ui.info("  4. Quit Lightroom before ejecting the SSD")
+    if presets_ok:
+        script = f"{cfg.mac_root_lr.rsplit('/', 2)[0]}/{presets.SSD_DIR}/{presets.MAC_SCRIPT}"
+        ui.info("Lightroom presets (Nik presets are not included):")
+        ui.info("  With Lightroom closed, run this in Terminal on the Mac, before step 2,")
+        ui.info("  and again before ejecting if you made presets there:")
+        ui.info(f'  bash "{script}"')
     ui.info("The PC catalog is locked until you run Arrive.")
 
 
@@ -501,6 +552,7 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
                or tree_fingerprint(ssd.lrcat + "-data") != pc_state.get("ssd_data_fingerprint"))
     photos = fsops.compare_trees(ssd.photos, cfg.desktop_photos, cfg.extra_skip_names)
     plan = _plan_readonly(ssd.lrcat, cfg.mac_root_lr, cfg.desktop_root_lr) if changed else None
+    preset_plan = _plan_presets(cfg, ssd, arriving=True)
 
     ui.info(f"Checked out:  {state.describe_since(pc_state)}")
     ui.info(f"SSD catalog:  saved {ui.format_time(os.path.getmtime(ssd.lrcat))}  "
@@ -520,6 +572,12 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
     else:
         ui.info("2. Unlock the PC catalog as it was (no edits to bring back)")
     ui.info(f"3. Mark the SSD copy as returned ({cfg.catalog_name}{state.RETURNED_SUFFIX})")
+    if preset_plan:
+        ui.info(f"4. Lightroom presets from the SSD: {preset_plan.describe()}")
+        for item in preset_plan.items[:5]:
+            ui.info(f"     {item.rel}")
+        if len(preset_plan.items) > 5:
+            ui.info(f"     ... and {len(preset_plan.items) - 5} more")
 
     if photos.to_copy:
         _check_space(cfg.desktop_photos, photos.bytes_to_copy, "archive drive")
@@ -561,6 +619,8 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
     state.write(ssd.catalog_dir, record)
     state.write(cfg.desktop_catalog_dir, record)
     log.info("Checked in catalog %s (changed=%s)", cfg.catalog_name, changed)
+
+    _copy_presets(cfg, ssd, preset_plan, arriving=True)
 
     ui.header("Checked in. The PC catalog is current again.")
     ui.info(f"Open Lightroom Classic on the PC; the catalog is at {cfg.desktop_lrcat}")
