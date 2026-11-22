@@ -24,10 +24,11 @@ def read(catalog_dir: str) -> dict:
     path = os.path.join(catalog_dir, STATE_FILE)
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {"status": "unreadable"}
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):  # ValueError: bad JSON or bad encoding
         return {"status": "unreadable"}
 
 

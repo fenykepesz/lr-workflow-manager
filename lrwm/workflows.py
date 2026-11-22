@@ -14,7 +14,7 @@ from contextlib import closing
 from datetime import datetime
 from typing import List, Optional
 
-from . import drives, fsops, presets, state, ui
+from . import drives, fsops, presets, situation, state, ui
 from . import lightroom as lr
 from .config import Config
 
@@ -74,16 +74,6 @@ def _check_lightroom_closed(cfg: Config, ssd: Optional[drives.SSD]) -> None:
             raise Abort(f"Lightroom lock files found on the {label}:\n  " + "\n  ".join(locks) +
                         "\nThe catalog seems to be open (or Lightroom crashed). "
                         "Open and properly quit Lightroom on that machine first.")
-
-
-def tree_fingerprint(path: str) -> Optional[dict]:
-    if not os.path.isdir(path):
-        return None
-    n = size = 0
-    latest = 0.0
-    for _, s, m in fsops._walk_all(path):
-        n, size, latest = n + 1, size + s, max(latest, m)
-    return {"files": n, "size": size, "mtime": round(latest, 3)}
 
 
 def _since_ts(record: dict) -> float:
@@ -367,6 +357,15 @@ def _copy_presets(cfg: Config, ssd: drives.SSD, plan: Optional[presets.Plan], ar
     return not errors
 
 
+def _pending_baseline(cfg: Config, ssd: drives.SSD) -> List[str]:
+    """Only used for the start screen's suggestion, so it never blocks a checkout."""
+    try:
+        return situation.pending_on_ssd(cfg, ssd)
+    except Exception:
+        log.exception("Could not record what was pending at Leave")
+        return []
+
+
 # ================================================================ LEAVE
 
 def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = False) -> None:
@@ -458,7 +457,7 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
     if dry_run:
         ui.info("\n  Dry run: nothing was changed.")
         return
-    if not ui.confirm("\n  Check the catalog out to the SSD now?", default=True):
+    if not ui.confirm("\n  Check the catalog out to the SSD now?", default=False):
         raise Abort("Cancelled. Nothing was changed.")
 
     # ---- do it (state changes only at the very end)
@@ -488,8 +487,9 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
         "checkout_id": uuid.uuid4().hex,
         "since": state.now_iso(),
         "ssd_fingerprint": lr.fingerprint(ssd.lrcat),
-        "ssd_data_fingerprint": tree_fingerprint(ssd.lrcat + "-data"),
+        "ssd_data_fingerprint": fsops.tree_fingerprint(ssd.lrcat + "-data"),
         "db_version": lr.db_version(ssd.lrcat),
+        "pending_at_leave": _pending_baseline(cfg, ssd),
         "brought": sorted({f for f in ssd_state.get("brought", [])
                            if os.path.isdir(os.path.join(ssd.photos, f))} | set(folders)),
     }
@@ -549,7 +549,7 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
                     f"Make sure the PC runs the same Lightroom version as the Mac.")
 
     changed = (not lr.same_fingerprint(lr.fingerprint(ssd.lrcat), pc_state.get("ssd_fingerprint"))
-               or tree_fingerprint(ssd.lrcat + "-data") != pc_state.get("ssd_data_fingerprint"))
+               or fsops.tree_fingerprint(ssd.lrcat + "-data") != pc_state.get("ssd_data_fingerprint"))
     photos = fsops.compare_trees(ssd.photos, cfg.desktop_photos, cfg.extra_skip_names)
     plan = _plan_readonly(ssd.lrcat, cfg.mac_root_lr, cfg.desktop_root_lr) if changed else None
     preset_plan = _plan_presets(cfg, ssd, arriving=True)
@@ -584,7 +584,7 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
     if dry_run:
         ui.info("\n  Dry run: nothing was changed.")
         return
-    if not ui.confirm("\n  Check the catalog back in now?", default=True):
+    if not ui.confirm("\n  Check the catalog back in now?", default=False):
         raise Abort("Cancelled. Nothing was changed.")
 
     # ---- photos first: if any fail, the catalog stays checked out
@@ -724,7 +724,12 @@ def status(cfg: Config) -> None:
     ui.header("STATUS")
     pc_state = state.read(cfg.desktop_catalog_dir)
     out = state.is_out(pc_state)
-    if out:
+    problem = situation.record_problem(cfg)
+    if problem:
+        ui.warn(problem)
+        ui.info("Catalog:      NEEDS ATTENTION (see above)")
+        lrcat = cfg.desktop_lrcat
+    elif out:
         ui.info(f"Catalog:      CHECKED OUT to the laptop since {state.describe_since(pc_state)}")
         lrcat = state.checked_out_path(cfg.desktop_catalog_dir, cfg.catalog_name)
     else:

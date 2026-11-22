@@ -100,7 +100,8 @@ To turn this off, set `"sync_presets": false`.
 - **Never overwrites newer files**: if a file differs and the destination copy is newer or the same age, it's left alone and reported.
 - **Catches forgotten photos**: Leave warns if the SSD has photos that never made it into the archive.
 - **Wrong SSD, or a catalog upgraded on the laptop**: Arrive refuses if the SSD doesn't hold this checkout, or if Lightroom on the laptop upgraded the catalog to a newer version.
-- **Dry run**: `--dry-run`, or `D` in the menu, shows the full plan without changing anything.
+- **Deliberate checkouts**: checking out or in needs a typed `y`, so repeated Enter presses can't lock the catalog.
+- **Dry run**: `--dry-run`, or `M` then `D` from the start screen, shows the full plan without changing anything.
 - **Emergency release**: if the SSD is lost, unlock the PC catalog as it was at checkout.
 - **Skips system junk**: macOS `._*` and `.DS_Store` files, Windows `Thumbs.db`, and Lightroom preview caches.
 
@@ -141,6 +142,29 @@ To turn this off, set `"sync_presets": false`.
 
 ## Usage
 
+Run the tool. It works out where you are in the trip and suggests one step:
+
+```
+  Catalog is AT HOME. SSD connected.
+
+  [Enter] Leave: prepare the SSD for a trip
+  [M] More options     [Q] Quit
+```
+
+| What it finds | What Enter does |
+|---|---|
+| Catalog at home | Starts Leave |
+| Catalog at home, but the SSD has files the archive doesn't | Starts Copy photos |
+| Catalog out, nothing changed since Leave | Quits: you're ready to travel (`A` cancels the trip with Arrive) |
+| Catalog out, and the catalog, photos or presets on the SSD changed | Starts Arrive |
+| SSD missing, or not the one holding the checkout | Checks again, after saying what to connect |
+| Damaged or contradictory checkout records | Nothing, and explains the problem |
+| A Leave or Arrive has just finished | Quits |
+
+It's only a suggestion: nothing starts until you press Enter, and checking the catalog out or in needs a typed `y`. Plain Enter at that question cancels.
+
+`M` shows every option:
+
 ```
   [1] Leave        check the catalog out to the SSD (+ take archive folders along)
   [2] Arrive       bring the catalog and new photos back to the PC
@@ -149,6 +173,7 @@ To turn this off, set `"sync_presets": false`.
   [5] Status       details, backups, what's on the SSD
   [D] Dry run      show plans without changing anything
   [R] Emergency release   (only while checked out)
+  [B] Back
 ```
 
 Command line:

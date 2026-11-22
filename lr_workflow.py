@@ -5,7 +5,7 @@ Check a Lightroom Classic catalog out to a portable SSD for editing on a
 travel laptop, and check it back in to the main PC afterwards.
 
 Usage:
-  python lr_workflow.py                 Interactive menu
+  python lr_workflow.py                 Suggest the next step
   python lr_workflow.py --leave         Check the catalog out to the SSD
   python lr_workflow.py --arrive        Bring the catalog and new photos back
   python lr_workflow.py --status        Show where the catalog is

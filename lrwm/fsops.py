@@ -177,6 +177,16 @@ def _walk_all(root: str) -> Iterable[Tuple[str, int, float]]:
             yield os.path.relpath(p, root), st.st_size, st.st_mtime
 
 
+def tree_fingerprint(path: str) -> Optional[dict]:
+    if not os.path.isdir(path):
+        return None
+    n = size = 0
+    latest = 0.0
+    for _, s, m in _walk_all(path):
+        n, size, latest = n + 1, size + s, max(latest, m)
+    return {"files": n, "size": size, "mtime": round(latest, 3)}
+
+
 def copy_dir_atomic(src: str, dst: str) -> None:
     """Replace directory dst with a full copy of src, all-or-nothing."""
     tmp, old = dst + TMP_SUFFIX, dst + OLD_SUFFIX

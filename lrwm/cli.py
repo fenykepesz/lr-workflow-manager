@@ -3,7 +3,7 @@
 import argparse
 import sys
 
-from . import __version__, drives, state, ui, workflows
+from . import __version__, situation, state, ui, workflows
 from .config import ConfigError, load_config
 
 
@@ -27,56 +27,105 @@ def _run(fn, *args, **kwargs) -> bool:
     return False
 
 
-def menu(cfg, dry_run: bool) -> None:
-    while True:
-        pc_state = state.read(cfg.desktop_catalog_dir)
-        out = state.is_out(pc_state)
-        ssd = drives.connect(cfg)
-        ui.header(f"LIGHTROOM WORKFLOW MANAGER {__version__}" + ("   [DRY RUN]" if dry_run else ""))
-        where = (f"CHECKED OUT to the laptop since {state.describe_since(pc_state)}"
-                 if out else "AT HOME (PC)")
-        ui.info(f"Catalog: {where}")
-        ui.info(f"SSD:     {'connected at ' + ssd.root if ssd else 'not connected'}")
-        rec = "2" if out else "1"
-        print()
-        options = [
-            ("1", "Leave", "check the catalog out to the SSD (+ take archive folders along)"),
-            ("2", "Arrive", "bring the catalog and new photos back to the PC"),
-            ("3", "Take along", "copy more archive folders to the SSD"),
-            ("4", "Copy photos", "copy new photos from the SSD to the archive only"),
-            ("5", "Status", "details, backups, what's on the SSD"),
-            ("D", "Dry run", f"show plans without changing anything (now {'ON' if dry_run else 'OFF'})"),
-        ]
-        if out:
-            options.append(("R", "Emergency release", "unlock the PC catalog without the SSD"))
-        options.append(("Q", "Quit", ""))
-        for key, name, desc in options:
-            mark = "  <- suggested" if key == rec and ssd else ""
-            ui.info(f"[{key}] {name:<18} {desc}{mark}")
-        try:
+SUGGESTED = {
+    # situation: (menu key, what Enter does)
+    situation.LEAVE: ("1", "Leave: prepare the SSD for a trip"),
+    situation.ARRIVE: ("2", "Arrive: bring the catalog and photos home"),
+    situation.COPY_PHOTOS: ("4", "Copy photos to the archive first"),
+}
+PROCEDURES = {"1": "leave", "2": "arrive", "3": "bring_folders", "4": "copy_photos"}
+
+
+def start(cfg, dry_run: bool = False) -> None:
+    """Interactive start: one suggested step, with everything else behind [M]."""
+    finished = None  # set after a Leave or Arrive, so another Enter can't start the opposite one
+    try:
+        while True:
+            print("\n  Checking the catalog and SSD...")
+            now = situation.detect(cfg)
+            ui.header(f"LIGHTROOM WORKFLOW MANAGER {__version__}" + ("   [DRY RUN]" if dry_run else ""))
+            ui.info(now.where)
+            if now.detail:
+                for line in now.detail.split("\n"):
+                    ui.info(line)
+            print()
+
+            enter = None  # a menu key, "quit", "again", or None for nothing
+            if finished and now.kind != situation.PROBLEM:
+                ui.info(finished)
+                enter, label = "quit", "Quit"
+            elif now.kind in SUGGESTED:
+                enter, label = SUGGESTED[now.kind]
+            elif now.kind == situation.READY:
+                enter, label = "quit", "Quit"
+            elif now.kind in (situation.NO_SSD, situation.WRONG_SSD):
+                enter, label = "again", "Check again"
+            if enter:
+                ui.info(f"[Enter] {label}")
+            if now.kind == situation.READY:
+                ui.info("[A] Trip cancelled: Arrive")
+            ui.info("[M] More options     [Q] Quit")
+
             choice = ui.ask("\n  Choose: ").upper()
-        except EOFError:
-            return
-        if choice == "1":
-            _run(workflows.leave, cfg, dry_run=dry_run)
-        elif choice == "2":
-            _run(workflows.arrive, cfg, dry_run=dry_run)
-        elif choice == "3":
-            _run(workflows.bring_folders, cfg, dry_run=dry_run)
-        elif choice == "4":
-            _run(workflows.copy_photos, cfg, dry_run=dry_run)
-        elif choice == "5":
-            _run(workflows.status, cfg)
-        elif choice == "D":
-            dry_run = not dry_run
-            continue
-        elif choice == "R" and out:
-            _run(workflows.release, cfg)
-        elif choice == "Q":
-            return
-        else:
-            continue
-        ui.pause()
+            if choice == "Q" or (not choice and enter == "quit"):
+                return
+            if choice == "M":
+                key = menu(cfg, now, dry_run)
+                if key == "Q":
+                    return
+                if key == "D":
+                    dry_run, finished = not dry_run, None
+                    continue
+                if key == "B":
+                    continue
+            elif choice == "A" and now.kind == situation.READY:
+                key = "2"
+            elif not choice and enter not in (None, "again"):
+                key = enter
+            else:
+                continue
+
+            finished = None
+            if key == "5":
+                _run(workflows.status, cfg)
+            elif key == "R":
+                _run(workflows.release, cfg)
+            else:
+                ok = _run(getattr(workflows, PROCEDURES[key]), cfg, dry_run=dry_run)
+                if ok and not dry_run and key in ("1", "2"):
+                    finished = ("Done. Eject the SSD before you unplug it." if key == "1"
+                                else "Done. You can open Lightroom on this PC.")
+            ui.pause()
+    except (EOFError, KeyboardInterrupt):
+        return
+
+
+def menu(cfg, now: situation.Situation, dry_run: bool) -> str:
+    """All options. Returns the key chosen; Enter never starts anything here."""
+    out = state.is_out(state.read(cfg.desktop_catalog_dir))
+    suggested = SUGGESTED.get(now.kind, ("", ""))[0]
+    ui.header("MORE OPTIONS", "-")
+    options = [
+        ("1", "Leave", "check the catalog out to the SSD (+ take archive folders along)"),
+        ("2", "Arrive", "bring the catalog and new photos back to the PC"),
+        ("3", "Take along", "copy more archive folders to the SSD"),
+        ("4", "Copy photos", "copy new photos from the SSD to the archive only"),
+        ("5", "Status", "details, backups, what's on the SSD"),
+        ("D", "Dry run", f"show plans without changing anything (now {'ON' if dry_run else 'OFF'})"),
+    ]
+    if out:
+        options.append(("R", "Emergency release", "unlock the PC catalog without the SSD"))
+    options += [("B", "Back", ""), ("Q", "Quit", "")]
+    for key, name, desc in options:
+        mark = "  <- suggested" if key == suggested else ""
+        ui.info(f"[{key}] {name:<18} {desc}{mark}")
+    keys = [key for key, _, _ in options]
+    while True:
+        choice = ui.ask("\n  Choose: ").upper()
+        if not choice:
+            return "B"
+        if choice in keys:
+            return choice
 
 
 def main(argv=None) -> int:
@@ -117,7 +166,7 @@ def main(argv=None) -> int:
         return 0 if _run(workflows.status, cfg) else 1
     if args.release:
         return 0 if _run(workflows.release, cfg) else 1
-    menu(cfg, args.dry_run)
+    start(cfg, args.dry_run)
     return 0
 
 
