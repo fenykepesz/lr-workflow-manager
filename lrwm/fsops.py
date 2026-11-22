@@ -80,6 +80,10 @@ class Comparison:
     def bytes_to_copy(self) -> int:
         return sum(f.size for f in self.to_copy)
 
+    @property
+    def bytes_replaced(self) -> int:
+        return sum(f.dst_size or 0 for f in self.updated)
+
 
 def compare_trees(src: str, dst: str, extra_skip: Iterable[str] = ()) -> Comparison:
     """Classify files under src against dst. Never looks at files only in dst."""
@@ -87,19 +91,23 @@ def compare_trees(src: str, dst: str, extra_skip: Iterable[str] = ()) -> Compari
     if not os.path.isdir(src):
         return result
     for rel, size, mtime in walk_files(src, extra_skip):
-        try:
-            st = os.stat(os.path.join(dst, rel))
-        except FileNotFoundError:
-            result.new.append(FileItem(rel, size, mtime))
-            continue
-        item = FileItem(rel, size, mtime, st.st_size, st.st_mtime)
-        if mtime > st.st_mtime + TIMESTAMP_TOLERANCE:
-            result.updated.append(item)
-        elif size == st.st_size:
-            result.same += 1
-        else:
-            result.conflicts.append(item)
+        _classify(result, rel, size, mtime, os.path.join(dst, rel))
     return result
+
+
+def _classify(result: Comparison, rel: str, size: int, mtime: float, target: str) -> None:
+    try:
+        st = os.stat(target)
+    except FileNotFoundError:
+        result.new.append(FileItem(rel, size, mtime))
+        return
+    item = FileItem(rel, size, mtime, st.st_size, st.st_mtime)
+    if mtime > st.st_mtime + TIMESTAMP_TOLERANCE:
+        result.updated.append(item)
+    elif size == st.st_size:
+        result.same += 1
+    else:
+        result.conflicts.append(item)
 
 
 def _remove(path: str) -> None:
@@ -210,18 +218,69 @@ def copy_dir_atomic(src: str, dst: str) -> None:
     _remove(old)
 
 
-def copy_files(items: List[FileItem], src_root: str, dst_root: str, label: str) -> List[Tuple[str, str]]:
-    """Copy a list of compared files. Returns [(rel, error)] for failures."""
+def same_content(a: str, b: str) -> bool:
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            buf = fa.read(CHUNK)
+            if buf != fb.read(CHUNK):
+                return False
+            if not buf:
+                return True
+
+
+def copy_files(items: List[FileItem], src_root: str, dst_root: str, label: str,
+               backup_root: str) -> List[Tuple[str, str]]:
+    """Copy a list of compared files. Returns [(rel, error)] for failures.
+
+    A destination file with other content is first copied to backup_root. If
+    that fails, the file isn't replaced.
+    """
     errors = []
     progress = Progress(label, sum(f.size for f in items))
     for f in items:
         try:
-            copy_file_atomic(os.path.join(src_root, f.rel), os.path.join(dst_root, f.rel),
-                             progress=progress)
+            src, dst = os.path.join(src_root, f.rel), os.path.join(dst_root, f.rel)
+            # Looked at now, not when planning: the file may have appeared since.
+            if os.path.exists(dst) and not same_content(src, dst):
+                copy_file_atomic(dst, os.path.join(backup_root, f.rel), verify=True)
+            copy_file_atomic(src, dst, progress=progress)
         except Exception as e:  # keep going; report at the end
             errors.append((f.rel, str(e)))
     progress.finish()
     return errors
+
+
+def plan_refresh(ssd_photos: str, archive: str, taken: List[str],
+                 extra_skip: Iterable[str] = ()) -> Tuple[Comparison, List[str]]:
+    """What folders already on the SSD, other than the `taken` ones, lack from the archive.
+
+    Only folders that hold files on the SSD, and only the files directly in
+    them, so a loose file in 'Models' doesn't pull in every folder under it.
+    Returns (archive compared to SSD, their subfolders that aren't on the SSD).
+    """
+    extra = {e.lower() for e in extra_skip}
+    taken = [os.path.normpath(t) for t in taken]
+    result, absent = Comparison(), []
+    here = {os.path.dirname(rel) for rel, _, _ in walk_files(ssd_photos, extra)}
+    for folder in sorted(here, key=str.casefold):
+        source = os.path.join(archive, folder)
+        if any(_is_under(folder, t) for t in taken) or not os.path.isdir(source):
+            continue
+        with os.scandir(source) as entries:
+            for e in entries:
+                rel = os.path.join(folder, e.name)
+                target = os.path.join(ssd_photos, rel)
+                if e.is_dir(follow_symlinks=False):
+                    if (not skip_dir(e.name) and not os.path.isdir(target)
+                            and not any(_is_under(rel, t) or _is_under(t, rel) for t in taken)
+                            and next(iter(walk_files(e.path, extra)), None)):
+                        absent.append(rel)
+                elif e.is_file(follow_symlinks=False) and not skip_file(e.name, extra):
+                    st = e.stat()
+                    _classify(result, rel, st.st_size, st.st_mtime, target)
+    return result, sorted(absent, key=str.casefold)
 
 
 def free_space(path: str) -> int:

@@ -12,7 +12,7 @@ import shutil
 import uuid
 from contextlib import closing
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import drives, eject, fsops, presets, situation, state, ui
 from . import lightroom as lr
@@ -20,6 +20,9 @@ from .config import Config
 
 log = logging.getLogger("lrwm")
 log.addHandler(logging.NullHandler())
+
+REPLACED_DIR = "ReplacedFiles"  # in the backup folder: photo files as they were before being replaced
+SEARCH_DEPTH = 3                # how deep to look for a folder typed by its name alone
 
 
 class Abort(Exception):
@@ -178,6 +181,43 @@ def _check_space(path: str, needed: int, label: str) -> None:
                     f"{ui.format_size(free)} free.")
 
 
+def _backup_drive(cfg: Config) -> str:
+    return cfg.backup_dir if os.path.isdir(cfg.backup_dir) else cfg.desktop_catalog_dir
+
+
+def _replaced_dir(cfg: Config) -> str:
+    """Where this run puts files it replaces. Only created if it replaces any."""
+    base = os.path.join(cfg.backup_dir, REPLACED_DIR, _stamp())
+    path, n = base, 1
+    while os.path.exists(path):
+        n += 1
+        path = f"{base}-{n}"
+    return path
+
+
+def _show_saving(cfg: Config, cmp: fsops.Comparison) -> None:
+    if cmp.updated:
+        ui.info(f"   The archive's {len(cmp.updated)} version(s) are saved first to "
+                f"{os.path.join(cfg.backup_dir, REPLACED_DIR)}")
+
+
+def _check_archive_space(cfg: Config, cmp: fsops.Comparison) -> None:
+    drive = lambda p: os.path.splitdrive(os.path.abspath(p))[0].casefold()
+    saving, copying = cmp.bytes_replaced, cmp.bytes_to_copy
+    if saving:
+        if drive(cfg.backup_dir) == drive(cfg.desktop_photos):
+            copying += saving
+        else:
+            _check_space(_backup_drive(cfg), saving, "backup drive")
+    _check_space(cfg.desktop_photos, copying, "archive drive")
+
+
+def _note_replaced(folder: str) -> None:
+    if os.path.isdir(folder):
+        ui.info(f"The replaced versions are saved in {folder}")
+        log.info("Saved replaced files to %s", folder)
+
+
 def _normalize_rel(rel: str) -> str:
     return os.path.normpath(rel.strip().strip("\"'").strip("\\/")) if rel.strip() else ""
 
@@ -225,8 +265,10 @@ def ask_folders(cfg: Config, suggested: Optional[List[str]] = None) -> List[str]
         ui.info("")
         ui.info("[Enter] take these folders   [+] take these and add more   "
                 "[M] choose manually instead   [N] take nothing")
+        ui.info("Or type a folder to take as well as these.")
         while True:
-            choice = ui.ask("Choice: ").lower()
+            typed = ui.ask("Choice: ").strip()
+            choice = typed.lower()
             if choice in ("", "y", "yes"):
                 return suggested
             if choice in ("n", "none"):
@@ -235,6 +277,21 @@ def ask_folders(cfg: Config, suggested: Optional[List[str]] = None) -> List[str]
                 return sorted(set(suggested) | set(_type_folders(cfg)), key=str.casefold)
             if choice == "m":
                 return _type_folders(cfg)
+            if choice.endswith("?"):
+                ui.info("To browse, press + (add to these) or M (choose instead). ? works there.")
+                continue
+            extra, problems = _resolve_folders(cfg, typed)
+            if extra and not problems:
+                taking = list(suggested)
+                for folder in extra:
+                    if folder.casefold() not in [t.casefold() for t in taking]:
+                        taking.append(folder)
+                taking.sort(key=str.casefold)
+                ui.info("Taking: " + "; ".join(taking))
+                return taking
+            for line in problems:
+                ui.info(line)
+            ui.info("Nothing was chosen. Press Enter, +, M or N, or type a folder to add.")
     return _type_folders(cfg)
 
 
@@ -259,12 +316,88 @@ def _type_folders(cfg: Config) -> List[str]:
             except OSError:
                 ui.info(f"    Not found: {base}")
             continue
-        folders = [_normalize_rel(p) for p in answer.split(";") if p.strip()]
-        missing = [f for f in folders if not os.path.isdir(os.path.join(cfg.desktop_photos, f))]
-        if missing:
-            ui.info("Not found in the archive: " + "; ".join(missing))
+        folders, problems = _resolve_folders(cfg, answer)
+        if problems:
+            for line in problems:
+                ui.info(line)
             continue
         return folders
+
+
+def _outside_archive(rel: str) -> bool:
+    return bool(os.path.splitdrive(rel)[0] or os.path.isabs(rel)
+                or os.path.normpath(rel).split(os.sep)[0] == os.pardir)
+
+
+def _resolve_folders(cfg: Config, answer: str) -> Tuple[List[str], List[str]]:
+    """Typed folders as (archive-relative paths, what was wrong with the others).
+
+    Takes a path in the archive, the same as a full path, or a folder's name alone.
+    """
+    root = cfg.desktop_photos
+    found, problems = [], []
+    for part in answer.split(";"):
+        shown = part.strip().strip("\"'")
+        if not shown:
+            continue
+        if os.path.splitdrive(shown)[0]:
+            try:
+                rel = os.path.relpath(shown, root)
+            except ValueError:  # another drive
+                rel = os.pardir
+        else:
+            rel = _normalize_rel(shown.replace("/", os.sep)) or "."
+        if _outside_archive(rel):
+            problems.append(f"'{shown}' isn't inside {root}")
+        elif rel == ".":
+            problems.append("The whole archive can't be taken along. Pick subfolders.")
+        elif os.path.isdir(os.path.join(root, rel)):
+            found.append(_as_on_disk(root, rel))
+        else:
+            matches = [] if os.sep in rel else _folders_named(root, rel)
+            if len(matches) == 1:
+                found.append(matches[0])
+            elif matches:
+                problems.append(f"'{shown}' is the name of several folders. Type one of these:")
+                problems += [f"    {m}" for m in matches[:10]]
+                if len(matches) > 10:
+                    problems.append(f"    ... and {len(matches) - 10} more")
+            else:
+                problems.append(f"'{shown}' isn't a folder in {root}")
+    return found, problems
+
+
+def _as_on_disk(root: str, rel: str) -> str:
+    """rel with the upper and lower case the folders really have."""
+    parts = []
+    for part in rel.split(os.sep):
+        try:
+            names = os.listdir(os.path.join(root, *parts))
+        except OSError:
+            names = []
+        parts.append(next((n for n in names if n.casefold() == part.casefold()), part))
+    return os.path.join(*parts)
+
+
+def _folders_named(root: str, name: str) -> List[str]:
+    found, level = [], [""]
+    for _ in range(SEARCH_DEPTH):
+        below = []
+        for parent in level:
+            try:
+                with os.scandir(os.path.join(root, parent)) as entries:
+                    subs = [e.name for e in entries if e.is_dir(follow_symlinks=False)]
+            except OSError:
+                continue
+            for sub in subs:
+                if fsops.skip_dir(sub):
+                    continue
+                rel = os.path.join(parent, sub)
+                below.append(rel)
+                if sub.casefold() == name.casefold():
+                    found.append(rel)
+        level = below
+    return sorted(found, key=str.casefold)
 
 
 def _ask_cleanup(cfg: Config, cleanup: List[fsops.CleanupGroup], dry_run: bool) -> bool:
@@ -294,11 +427,42 @@ def _ask_cleanup(cfg: Config, cleanup: List[fsops.CleanupGroup], dry_run: bool) 
     return ui.confirm("Remove the files that are safe in the archive from the SSD?", default=False)
 
 
+def _ask_refresh(refresh: fsops.Comparison, absent: List[str], dry_run: bool) -> bool:
+    """Show what folders staying on the SSD lack; ask whether to bring them up to date."""
+    if not (refresh.to_copy or absent or refresh.conflicts):
+        return False
+    ui.info("")
+    if refresh.to_copy:
+        ui.info("Folders staying on the SSD are out of date:")
+        _show_files("  Older on the SSD", refresh.updated)
+        _show_files("  Missing on the SSD", refresh.new)
+    if absent:
+        ui.info("Their subfolders that aren't on the SSD (not copied; take them along if you need them):")
+        for rel in absent[:5]:
+            ui.info(f"    {rel}")
+        if len(absent) > 5:
+            ui.info(f"    ... and {len(absent) - 5} more")
+    _show_conflicts(refresh.conflicts, "Archive", "SSD")
+    if not refresh.to_copy:
+        return False
+    if dry_run:
+        ui.info("  (A real run asks whether to refresh them from the archive.)")
+        return False
+    if ui.confirm(f"Refresh them from the archive ({ui.format_size(refresh.bytes_to_copy)})?", default=True):
+        return True
+    if refresh.updated:
+        ui.warn("The older versions stay on the SSD, so don't edit those on the laptop.\n"
+                "An edited old version would replace the newer one at Arrive (which is saved first).")
+    return False
+
+
 def _plan_bring(cfg: Config, ssd: drives.SSD, folders: List[str]):
     plans = []
     for rel in folders:
         if rel in ("", "."):
             raise Abort("Taking the whole archive along is not supported; pick subfolders.")
+        if _outside_archive(rel):
+            raise Abort(f"Not a folder inside the archive: {rel}")
         cmp = fsops.compare_trees(os.path.join(cfg.desktop_photos, rel),
                                   os.path.join(ssd.photos, rel), cfg.extra_skip_names)
         plans.append((rel, cmp))
@@ -306,11 +470,16 @@ def _plan_bring(cfg: Config, ssd: drives.SSD, folders: List[str]):
 
 
 def _copy_bring(cfg: Config, ssd: drives.SSD, plans) -> None:
+    """Copy from the archive to the SSD. An empty folder in plans is the refresh."""
     errors = []
+    saved = _replaced_dir(cfg)
     for rel, cmp in plans:
         if cmp.to_copy:
+            label = rel[:24] if rel else "Refresh"
             errors += fsops.copy_files(cmp.to_copy, os.path.join(cfg.desktop_photos, rel),
-                                       os.path.join(ssd.photos, rel), f"{rel[:24]:<24}")
+                                       os.path.join(ssd.photos, rel), f"{label:<24}",
+                                       os.path.join(saved, "SSD", rel))
+    _note_replaced(saved)
     if errors:
         for rel, err in errors[:10]:
             ui.info(f"    ERROR {rel}: {err}")
@@ -417,17 +586,25 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
     cleanup = fsops.plan_cleanup(ssd.photos, cfg.desktop_photos, folders, cfg.extra_skip_names)
     remove_old = _ask_cleanup(cfg, cleanup, dry_run)
     freed = sum(g.safe_bytes for g in cleanup) if remove_old else 0
+    copies = list(bring)
+    refreshed = None
+    if not remove_old:  # what stays should match the archive
+        refresh, absent = fsops.plan_refresh(ssd.photos, cfg.desktop_photos, folders, cfg.extra_skip_names)
+        if _ask_refresh(refresh, absent, dry_run):
+            refreshed = refresh
+            copies.append(("", refresh))
+    replaced = sum(len(c.updated) for _, c in copies)
 
     # 5. Plan the catalog copy
     plan = _plan_readonly(cfg.desktop_lrcat, cfg.desktop_root_lr, cfg.mac_root_lr)
     data_dir = cfg.desktop_lrcat + "-data"
     catalog_bytes = os.path.getsize(cfg.desktop_lrcat) + (fsops.tree_size(data_dir) if os.path.isdir(data_dir) else 0)
-    bring_bytes = sum(c.bytes_to_copy for _, c in bring)
+    bring_bytes = sum(c.bytes_to_copy for _, c in copies)
     preset_plan = _plan_presets(cfg, ssd, arriving=False)
     preset_bytes = preset_plan.bytes_to_copy if preset_plan else 0
     _check_space(ssd.root, max(catalog_bytes + bring_bytes + preset_bytes - freed, 0), "SSD")
-    _check_space(cfg.backup_dir if os.path.isdir(cfg.backup_dir) else cfg.desktop_catalog_dir,
-                 catalog_bytes, "backup drive")
+    _check_space(_backup_drive(cfg), catalog_bytes + sum(c.bytes_replaced for _, c in copies),
+                 "backup drive")
 
     ui.header("Plan", "-")
     steps = []
@@ -443,6 +620,12 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
                      [f"   {rel}: {len(cmp.to_copy)} file(s) to copy "
                       f"({ui.format_size(cmp.bytes_to_copy)}), {cmp.same} already on SSD"
                       for rel, cmp in bring])
+    if refreshed:
+        steps.append([f"Refresh the folders staying on the SSD: {len(refreshed.to_copy)} file(s) "
+                      f"({ui.format_size(refreshed.bytes_to_copy)})"])
+    if replaced:
+        steps.append([f"Save the {replaced} older SSD file(s) being replaced to "
+                      f"{os.path.join(cfg.backup_dir, REPLACED_DIR)}"])
     if preset_plan:
         steps.append([f"Copy Lightroom presets to {ssd.presets}", f"   {preset_plan.describe()}"])
     steps.append([f"Lock the PC catalog until it comes back "
@@ -467,7 +650,7 @@ def leave(cfg: Config, folders: Optional[List[str]] = None, dry_run: bool = Fals
             ui.info(f"    Could not remove {rel}: {err}")
         log.info("Removed %d file(s) not part of this trip from the SSD (%d errors)",
                  sum(len(g.safe) for g in cleanup) - len(errors), len(errors))
-    _copy_bring(cfg, ssd, bring)
+    _copy_bring(cfg, ssd, copies)
     presets_ok = _copy_presets(cfg, ssd, preset_plan, arriving=False)
     backup_pc_catalog(cfg, cfg.desktop_lrcat)
     stashed = stash_ssd_catalog(cfg, ssd)
@@ -565,6 +748,7 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
         ui.info("1. Copy photos from the SSD to the archive:")
         _show_files("   New", photos.new)
         _show_files("   Updated on the Mac", photos.updated)
+        _show_saving(cfg, photos)
     else:
         ui.info("1. Photos: archive already has everything on the SSD")
     _show_conflicts(photos.conflicts, "SSD", "archive")
@@ -585,7 +769,7 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
             ui.info(f"     ... and {len(preset_plan.items) - 10} more")
 
     if photos.to_copy:
-        _check_space(cfg.desktop_photos, photos.bytes_to_copy, "archive drive")
+        _check_archive_space(cfg, photos)
     if dry_run:
         ui.info("\n  Dry run: nothing was changed.")
         return
@@ -594,7 +778,10 @@ def arrive(cfg: Config, dry_run: bool = False) -> None:
 
     # ---- photos first: if any fail, the catalog stays checked out
     if photos.to_copy:
-        errors = fsops.copy_files(photos.to_copy, ssd.photos, cfg.desktop_photos, "Photos  ")
+        saved = _replaced_dir(cfg)
+        errors = fsops.copy_files(photos.to_copy, ssd.photos, cfg.desktop_photos, "Photos  ",
+                                  os.path.join(saved, "archive"))
+        _note_replaced(saved)
         if errors:
             for rel, err in errors[:10]:
                 ui.info(f"    ERROR {rel}: {err}")
@@ -661,6 +848,11 @@ def bring_folders(cfg: Config, folders: Optional[List[str]] = None, dry_run: boo
                 f"{cmp.same} already on SSD")
         _show_conflicts(cmp.conflicts, "Archive", "SSD")
     _check_space(ssd.root, sum(c.bytes_to_copy for _, c in plans), "SSD")
+    replaced = sum(len(c.updated) for _, c in plans)
+    if replaced:
+        _check_space(_backup_drive(cfg), sum(c.bytes_replaced for _, c in plans), "backup drive")
+        ui.info(f"{replaced} older SSD file(s) will be replaced, and saved first to "
+                f"{os.path.join(cfg.backup_dir, REPLACED_DIR)}")
     pc_state = state.read(cfg.desktop_catalog_dir)
     if not state.is_out(pc_state):
         ui.info("Note: the catalog is at home. These photos will be online on the Mac after you Leave.")
@@ -684,18 +876,22 @@ def copy_photos(cfg: Config, dry_run: bool = False) -> None:
     cmp = fsops.compare_trees(ssd.photos, cfg.desktop_photos, cfg.extra_skip_names)
     _show_files("New", cmp.new)
     _show_files("Updated", cmp.updated)
+    _show_saving(cfg, cmp)
     ui.info(f"Already in archive: {cmp.same}")
     _show_conflicts(cmp.conflicts, "SSD", "archive")
     if not cmp.to_copy:
         ui.info("Nothing to copy.")
         return
-    _check_space(cfg.desktop_photos, cmp.bytes_to_copy, "archive drive")
+    _check_archive_space(cfg, cmp)
     if dry_run:
         ui.info("\n  Dry run: nothing was changed.")
         return
     if not ui.confirm("Copy now?", default=True):
         raise Abort("Cancelled.")
-    errors = fsops.copy_files(cmp.to_copy, ssd.photos, cfg.desktop_photos, "Photos  ")
+    saved = _replaced_dir(cfg)
+    errors = fsops.copy_files(cmp.to_copy, ssd.photos, cfg.desktop_photos, "Photos  ",
+                              os.path.join(saved, "archive"))
+    _note_replaced(saved)
     for rel, err in errors[:10]:
         ui.info(f"    ERROR {rel}: {err}")
     ui.info(f"Copied {len(cmp.to_copy) - len(errors)} file(s), {len(errors)} error(s).")

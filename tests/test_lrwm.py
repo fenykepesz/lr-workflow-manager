@@ -273,8 +273,8 @@ class FsopsTests(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.join(self.dst, "d")), ["1"])
 
 
-class WorkflowTests(unittest.TestCase):
-    """Full leave/arrive cycles with fake PC + SSD folders."""
+class WorkflowBase(unittest.TestCase):
+    """Fake PC and SSD folders."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -306,6 +306,10 @@ class WorkflowTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+
+class WorkflowTests(WorkflowBase):
+    """Full leave/arrive cycles."""
 
     def test_full_cycle_with_mac_edits_and_new_trip(self):
         self.answers = ["y"]
@@ -564,6 +568,210 @@ class WorkflowTests(unittest.TestCase):
         self.answers = ["y", "y"]
         workflows.leave(self.cfg, folders=[])
         self.assertTrue(os.path.exists(kept))
+
+
+class KeptFolderTests(WorkflowBase):
+    """Folders left on the SSD from earlier trips, and files that get replaced."""
+
+    def setUp(self):
+        super().setUp()
+        self.ssd_photos = os.path.join(self.ssd_root, "Photography")
+        self.old = time.time() - 5000
+        write(self.ssd("Models", "Ira", "1.raf"), b"raw1",
+              os.path.getmtime(self.pc("Models", "Ira", "1.raf")))
+
+    def pc(self, *parts):
+        return os.path.join(self.archive, *parts)
+
+    def ssd(self, *parts):
+        return os.path.join(self.ssd_photos, *parts)
+
+    def read(self, path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def saved(self):
+        root = os.path.join(self.cfg.backup_dir, workflows.REPLACED_DIR)
+        out = {}
+        for d, _, files in os.walk(root):
+            for f in files:
+                rel = os.path.relpath(os.path.join(d, f), root).split(os.sep, 1)[1]
+                out[rel.replace(os.sep, "/")] = self.read(os.path.join(d, f))
+        return out
+
+    def stale(self):
+        write(self.pc("Models", "Ira", "1.psd"), b"newer edit", self.old + 1000)
+        write(self.ssd("Models", "Ira", "1.psd"), b"older", self.old)
+        write(self.pc("Models", "Ira", "1.xmp"), b"sidecar", self.old)
+
+    def test_refresh_updates_and_adds_and_saves_what_it_replaced(self):
+        self.stale()
+        self.answers = ["n", "", "y"]  # keep folders, Enter = refresh, confirm
+        workflows.leave(self.cfg, folders=[])
+        self.assertEqual(self.read(self.ssd("Models", "Ira", "1.psd")), b"newer edit")
+        self.assertEqual(self.read(self.ssd("Models", "Ira", "1.xmp")), b"sidecar")
+        self.assertEqual(self.saved(), {"SSD/Models/Ira/1.psd": b"older"})
+        self.assertEqual(state.read(self.pc_cat_dir)["pending_at_leave"], [])
+
+    def test_refresh_can_be_declined(self):
+        self.stale()
+        self.answers = ["n", "n", "y"]
+        workflows.leave(self.cfg, folders=[])
+        self.assertEqual(self.read(self.ssd("Models", "Ira", "1.psd")), b"older")
+        self.assertFalse(os.path.exists(self.ssd("Models", "Ira", "1.xmp")))
+        self.assertEqual(self.saved(), {})
+
+    def test_cancelled_leave_refreshes_nothing(self):
+        self.stale()
+        self.answers = ["n", "y", ""]
+        with self.assertRaises(workflows.Abort):
+            workflows.leave(self.cfg, folders=[])
+        self.assertEqual(self.read(self.ssd("Models", "Ira", "1.psd")), b"older")
+        self.assertEqual(self.saved(), {})
+
+    def test_dry_run_asks_and_changes_nothing(self):
+        self.stale()
+        workflows.leave(self.cfg, folders=[], dry_run=True)
+        self.assertEqual(self.read(self.ssd("Models", "Ira", "1.psd")), b"older")
+        self.assertEqual(self.saved(), {})
+
+    def test_no_refresh_question_when_up_to_date_or_removed(self):
+        self.answers = ["n", "y"]
+        workflows.leave(self.cfg, folders=[])
+        self.assertEqual(self.answers, [])
+
+    def test_removed_folders_are_not_refreshed(self):
+        self.stale()
+        self.answers = ["y", "y"]  # remove, confirm
+        workflows.leave(self.cfg, folders=[])
+        self.assertFalse(os.path.exists(self.ssd("Models", "Ira")))
+
+    def test_refresh_adds_no_folders(self):
+        write(self.ssd("Models", "loose.jpg"), b"loose", self.old)
+        write(self.pc("Models", "loose.jpg"), b"loose", self.old)
+        write(self.pc("Models", "Other", "2.raf"), b"other")
+        write(self.pc("Models", "Ira", "Developed", "1.jpg"), b"jpg")
+        cmp, absent = fsops.plan_refresh(self.ssd_photos, self.archive, [])
+        self.assertEqual(cmp.to_copy, [])
+        self.assertEqual(absent, [os.path.join("Models", "Ira", "Developed"), os.path.join("Models", "Other")])
+
+    def test_refresh_leaves_taken_folders_and_junk_to_others(self):
+        self.stale()
+        write(self.pc("Models", "Ira", "Thumbs.db"), b"junk")
+        cmp, _ = fsops.plan_refresh(self.ssd_photos, self.archive, [])
+        self.assertEqual(sorted(os.path.basename(f.rel) for f in cmp.to_copy), ["1.psd", "1.xmp"])
+        cmp, absent = fsops.plan_refresh(self.ssd_photos, self.archive, [os.path.join("Models", "Ira")])
+        self.assertEqual((cmp.to_copy, absent), ([], []))
+
+    def test_refresh_never_replaces_a_newer_ssd_file(self):
+        write(self.pc("Models", "Ira", "1.psd"), b"pc", self.old)
+        write(self.ssd("Models", "Ira", "1.psd"), b"laptop edit", self.old + 1000)
+        cmp, _ = fsops.plan_refresh(self.ssd_photos, self.archive, [])
+        self.assertEqual((cmp.to_copy, len(cmp.conflicts)), ([], 1))
+
+    def leave_then_edit(self):
+        write(self.pc("Models", "Ira", "1.psd"), b"original", self.old)
+        self.answers = ["y"]
+        workflows.leave(self.cfg, folders=[os.path.join("Models", "Ira")])
+        write(self.ssd("Models", "Ira", "1.psd"), b"edited on the laptop", self.old + 1000)
+
+    def test_arrive_saves_the_archive_file_it_replaces(self):
+        self.leave_then_edit()
+        self.answers = ["y"]
+        workflows.arrive(self.cfg)
+        self.assertEqual(self.read(self.pc("Models", "Ira", "1.psd")), b"edited on the laptop")
+        self.assertEqual(self.saved(), {"archive/Models/Ira/1.psd": b"original"})
+
+    def test_arrive_dry_run_saves_nothing(self):
+        self.leave_then_edit()
+        workflows.arrive(self.cfg, dry_run=True)
+        self.assertEqual(self.saved(), {})
+
+    def test_failed_backup_replaces_nothing_and_stays_checked_out(self):
+        self.leave_then_edit()
+        real = fsops.copy_file_atomic
+
+        def failing(src, dst, **kw):
+            if workflows.REPLACED_DIR in dst:
+                raise OSError("backup drive is full")
+            return real(src, dst, **kw)
+
+        self.answers = ["y"]
+        with mock.patch.object(fsops, "copy_file_atomic", side_effect=failing):
+            with self.assertRaises(workflows.Abort):
+                workflows.arrive(self.cfg)
+        self.assertEqual(self.read(self.pc("Models", "Ira", "1.psd")), b"original")
+        self.assertTrue(os.path.exists(state.checked_out_path(self.pc_cat_dir, "Cat")))
+
+    def test_copy_photos_saves_the_archive_file_it_replaces(self):
+        self.leave_then_edit()
+        self.answers = ["y"]
+        workflows.copy_photos(self.cfg)
+        self.assertEqual(self.saved(), {"archive/Models/Ira/1.psd": b"original"})
+
+    def test_take_along_saves_the_ssd_file_it_replaces(self):
+        self.stale()
+        self.answers = ["y"]
+        workflows.bring_folders(self.cfg, folders=[os.path.join("Models", "Ira")])
+        self.assertEqual(self.saved(), {"SSD/Models/Ira/1.psd": b"older"})
+
+    def test_identical_content_needs_no_backup(self):
+        write(self.pc("Models", "Ira", "1.raf"), b"raw1", self.old + 3000)
+        self.answers = ["y"]
+        workflows.bring_folders(self.cfg, folders=[os.path.join("Models", "Ira")])
+        self.assertEqual(self.saved(), {})
+
+    def test_file_that_appeared_after_planning_is_saved(self):
+        write(self.ssd("Models", "Ira", "late.psd"), b"laptop")
+        cmp = fsops.compare_trees(self.ssd_photos, self.archive)
+        write(self.pc("Models", "Ira", "late.psd"), b"appeared")
+        errors = fsops.copy_files(cmp.to_copy, self.ssd_photos, self.archive, "x",
+                                  os.path.join(self.tmp.name, "saved"))
+        self.assertEqual(errors, [])
+        self.assertEqual(self.read(os.path.join(self.tmp.name, "saved", "Models", "Ira", "late.psd")), b"appeared")
+
+
+class ChoiceTests(WorkflowBase):
+    def setUp(self):
+        super().setUp()
+        for parts in (("Models", "Ivy"), ("Abroad", "Studio"), ("Models", "Studio")):
+            os.makedirs(os.path.join(self.archive, *parts))
+        self.ira = os.path.join("Models", "Ira")
+        self.ivy = os.path.join("Models", "Ivy")
+
+    def choose(self, *answers):
+        self.answers = list(answers)
+        got = workflows.ask_folders(self.cfg, [self.ira])
+        self.assertEqual(self.answers, [])
+        return got
+
+    def test_typed_folder_is_added(self):
+        both = sorted([self.ira, self.ivy], key=str.casefold)
+        for typed in (self.ivy, "models/ivy", "ivy", '"Models/Ivy"', os.path.join(self.archive, self.ivy),
+                      "\\" + self.ivy):
+            self.assertEqual(self.choose(typed), both, typed)
+
+    def test_several_typed_at_once(self):
+        self.assertEqual(len(self.choose("Ivy; Abroad/Studio")), 3)
+
+    def test_already_suggested_is_not_doubled(self):
+        self.assertEqual(self.choose("ira"), [self.ira])
+
+    def test_bad_input_explains_and_asks_again(self):
+        outside = os.path.join(self.tmp.name, "pc", "Catalog")
+        for bad in ("nosuch", "Studio", "..", "../Catalog", outside, ".", ";", "Ivy; nosuch", "?"):
+            self.assertEqual(self.choose(bad, "n"), [], bad)
+
+    def test_letters_still_work(self):
+        self.assertEqual(self.choose(""), [self.ira])
+        self.assertEqual(self.choose("N"), [])
+        self.assertEqual(self.choose("m", "Ivy"), [self.ivy])
+        self.assertEqual(self.choose("+", ""), [self.ira])
+
+    def test_folder_outside_archive_is_refused_from_command_line(self):
+        for bad in (os.path.join("..", "Catalog"), self.pc_cat_dir):
+            with self.assertRaises(workflows.Abort):
+                workflows.bring_folders(self.cfg, folders=[bad])
 
 
 class PresetTests(unittest.TestCase):

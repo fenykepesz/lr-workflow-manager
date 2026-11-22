@@ -99,6 +99,8 @@ To turn this off, set `"sync_presets": false`.
 - **Copies are all-or-nothing**: every copy is written to a temporary file and only replaces the original once complete. Catalogs are also checked against a checksum. An interrupted copy never leaves a half-written catalog.
 - **State changes last**: photos and catalog are copied before anything is locked or unlocked. If something fails, the catalog stays usable where it was, and you can re-run.
 - **Backups, cleaned up automatically**: a full backup of the PC catalog is made before every checkout (keeping the last 5 by default). A catalog already on the SSD is moved to `LRWM-Backups` on the SSD, never deleted, and renamed `.lrcat.backup` so the laptop can't open it by mistake.
+- **Replaced photo files are saved first**: before Arrive or Copy photos replaces a file in the archive, or Leave or Take along replaces one on the SSD, the old version is copied to `ReplacedFiles` in `backup_dir`. If that copy fails, the file isn't replaced. These backups are not rotated, so delete old ones yourself.
+- **Kept SSD folders don't go stale**: if you keep folders from an earlier trip on the SSD, Leave offers to copy in what is newer or missing from the archive. It doesn't add subfolders that aren't on the SSD, but lists them so you can take them along.
 - **Never overwrites newer files**: if a file differs and the destination copy is newer or the same age, it's left alone and reported.
 - **Catches forgotten photos**: Leave warns if the SSD has photos that never made it into the archive.
 - **Wrong SSD, or a catalog upgraded on the laptop**: Arrive refuses if the SSD doesn't hold this checkout, or if Lightroom on the laptop upgraded the catalog to a newer version.
@@ -163,6 +165,8 @@ Run the tool. It works out where you are in the trip and suggests one step:
 | SSD missing, or not the one holding the checkout | Checks again, after saying what to connect |
 | Damaged or contradictory checkout records | Nothing, and explains the problem |
 | A Leave or Arrive has just finished | Ejects the SSD and quits |
+
+When Leave or Take along offers the collection's folders, you can also type another folder at `Choice:` to add it. A path in the archive, a full path or just the folder's name works.
 
 It's only a suggestion: nothing starts until you press Enter, and checking the catalog out or in needs a typed `y`. Plain Enter at that question cancels.
 
